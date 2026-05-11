@@ -62,12 +62,19 @@ const LVL_RANK={"Triple-A":1,"Double-A":2,"High-A":3,"Single-A":4,"Rookie":5};
 const fvColor=fv=>{const v=parseInt(fv);if(v>=70)return"#FFD700";if(v>=60)return"#4CAF50";if(v>=55)return"#4FC3F7";if(v>=50)return"#FF9800";if(v>=45)return"#9C27B0";return"#666";};
 const PSA={10:{l:"Gem Mint",c:"#FFD700"},9:{l:"Mint",c:"#C0C0C0"},8:{l:"Near Mint-Mint",c:"#4FC3F7"},7:{l:"Near Mint",c:"#4CAF50"},6:{l:"Excellent-Mint",c:"#AED581"},5:{l:"Excellent",c:"#9C27B0"},4:{l:"VG-Excellent",c:"#FF9800"},3:{l:"Very Good",c:"#FF5722"},2:{l:"Good",c:"#795548"},1:{l:"Poor",c:"#9E9E9E"}};
 
-// ── Storage shim ─────────────────────────────────────────────────────────────
+// ── Storage (localStorage - persists across sessions on GitHub Pages) ────────
 const mem={};
 const store={
-  get:async k=>{try{const r=await window.storage.get(k);return r;}catch{return mem[k]?{value:mem[k]}:null;}},
-  set:async(k,v)=>{try{await window.storage.set(k,v);}catch{mem[k]=v;}},
-  del:async k=>{try{await window.storage.delete(k);}catch{delete mem[k];}}
+  get:async k=>{
+    try{const v=localStorage.getItem(k);return v!=null?{value:v}:null;}
+    catch{return mem[k]?{value:mem[k]}:null;}
+  },
+  set:async(k,v)=>{
+    try{localStorage.setItem(k,v);}catch(e){mem[k]=v;}
+  },
+  del:async k=>{
+    try{localStorage.removeItem(k);}catch{delete mem[k];}
+  }
 };
 
 // ── Decompress ───────────────────────────────────────────────────────────────
@@ -818,7 +825,9 @@ function App(){
           setBios(mergeBios(rawBios,liveBios));
           setHitting(mergeHitting(allHit,liveHit));
           setStatcast(mergeSc(rawSc,liveSc));
-          setFg(rawFg);
+          // Load FG from localStorage if available, otherwise use embedded
+          const storedFg=await store.get("milb-fg-live");
+          setFg(storedFg?.value ? JSON.parse(storedFg.value) : rawFg);
           if(storedWl?.value)setWatchlist(JSON.parse(storedWl.value));
         }catch{
           setBios(rawBios);setHitting(allHit);setStatcast(rawSc);setFg(rawFg);
@@ -937,6 +946,8 @@ function App(){
         return{n:obj.Name||"",pos:obj.Pos||"",org:obj.Org||"",rk:parseFloat(obj["Top 100"])||null,age:parseFloat(obj.Age)||null,hit:obj.Hit||"",pwr_g:obj["Game Pwr"]||"",pwr_r:obj["Raw Pwr"]||"",spd:obj.Spd||"",fld:obj.Fld||"",fv:obj.FV||"",hh:parseFloat(obj["Hard Hit%"])||null,cs:obj["Con Style"]||""};
       }).filter(r=>r.n);
       setFg(rows);
+      // Persist FG import to localStorage
+      store.set("milb-fg-live", JSON.stringify(rows));
     };
     reader.readAsText(file);
   };
