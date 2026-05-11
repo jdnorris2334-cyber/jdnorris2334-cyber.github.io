@@ -772,8 +772,574 @@ function CardGraderTab({initialPlayer}){
   );
 }
 
+
+// ── 130point API ─────────────────────────────────────────────────────────────
+const PT_API = "https://back.130point.com/cards/";
+
+function buildQuery(playerName){ return "1st Bowman " + playerName; }
+
+async function fetch130point(query, token){
+  const body = new URLSearchParams({
+    query, sort:"date", mp:"eBay", tab_id:"1",
+    tz:"America/Chicago", width:"400", height:"800", tk:token
+  });
+  const res = await fetch(PT_API, {
+    method:"POST",
+    headers:{
+      "Content-Type":"application/x-www-form-urlencoded",
+      "Referer":"https://130point.com/sales/",
+      "Origin":"https://130point.com"
+    },
+    body: body.toString()
+  });
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
+}
+
+function detect130PointTokenError(html){
+  const low = (html||"").toLowerCase();
+  if(!html || html.trim().length < 50) return "empty_response";
+  if(low.includes("invalid") && low.includes("token")) return "invalid_token";
+  if(low.includes("unauthorized") || low.includes("403")) return "unauthorized";
+  if(low.includes("expired")) return "expired_token";
+  // No data-price found at all in a reasonable-length response
+  if(html.length > 200 && !html.includes("data-price=")) return "no_data";
+  return null;
+}
+
+// ── Parsing ───────────────────────────────────────────────────────────────────
+function parseSales(html){
+  const sales = [];
+  const re = /data-price="([\d.]+)"([^<]*(?:<(?!tr)[^<]*)*?)(<tr[\s\S]*?<\/tr>)?/gi;
+  // Simpler: scan all data-price occurrences
+  const priceRe = /data-price="([\d.,]+)"/g;
+  // Find each table row
+  const rowRe = /<tr[\s\S]*?<\/tr>/gi;
+  const rows = html.match(rowRe) || [];
+  for(const row of rows){
+    const pm = row.match(/data-price="([\d.,]+)"/);
+    if(!pm) continue;
+    const price = parseFloat(pm[1].replace(/,/g,""));
+    if(!price || price<=0 || price>100000) continue;
+    const title = extractTitle(row);
+    const soldDate = extractDate(row);
+    sales.push({price, title, soldDate});
+  }
+  return sales;
+}
+
+function extractTitle(row){
+  // Try anchor text first
+  const aMatch = row.match(/<a[^>]*>([^<]+)<\/a>/i);
+  if(aMatch) return cleanHtml(aMatch[1]);
+  // Try data-name attr
+  const dn = row.match(/data-name="([^"]+)"/i);
+  if(dn) return cleanHtml(dn[1]);
+  // Fallback: strip tags
+  return cleanHtml(row).slice(0,160).trim();
+}
+
+function extractDate(row){
+  const plain = cleanHtml(row);
+  // "Wed 15 Apr 2026 16:35:25"
+  const m1 = plain.match(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/i);
+  if(m1){
+    const months={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+    const mo = months[m1[2].toLowerCase()];
+    if(mo!=null) return new Date(parseInt(m1[3]), mo, parseInt(m1[1]));
+  }
+  // mm/dd/yyyy
+  const m2 = plain.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+  if(m2) return new Date(parseInt(m2[3]<100?m2[3]+2000:m2[3]), parseInt(m2[1])-1, parseInt(m2[2]));
+  return null;
+}
+
+function cleanHtml(s){
+  return (s||"").replace(/<[^>]*>/g," ").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&nbsp;/g," ").replace(/\s+/g," ").trim();
+}
+
+// ── Classification ────────────────────────────────────────────────────────────
+const JUNK_WORDS = ["lot","break","random","pick","choose","case","repack","reprint","custom","proxy","digital","player break"];
+const INSERT_WORDS = ["top 100","spotlight","scouting report","modern prospects","talent pipeline","futures game","all-american","all american","national showcase","glory","image variation","short print"];
+
+function isBowman1st(title){
+  const t = title.toLowerCase();
+  return t.includes("bowman") && (t.includes("1st") || t.includes("first bowman"));
+}
+function isExcluded(title){
+  const t = title.toLowerCase();
+  for(const w of JUNK_WORDS) if(t.includes(w)) return w;
+  for(const w of INSERT_WORDS) if(t.includes(w)) return w;
+  return null;
+}
+function isAuto(title){
+  const t = title.toLowerCase();
+  return t.includes("auto") || t.includes("autograph") || t.includes("signature");
+}
+function cardType(title){ return title.toLowerCase().includes("chrome") ? "Chrome" : "Paper"; }
+function gradeBucket(title){
+  const t = title.toUpperCase();
+  if(t.includes("PSA 10")||t.includes("PSA10")) return "PSA10";
+  if(t.includes("PSA 9")||t.includes("PSA9")) return "PSA9";
+  if(t.includes("PSA")) return "OTHER_PSA";
+  return "RAW";
+}
+function detectParallel(title){
+  const t = title.toLowerCase();
+  const pr = (title.match(/\/\s*(\d{1,4})/)||[])[1];
+  const suf = pr ? ` /${pr}` : "";
+  if(t.includes("superfractor")||t.includes("1/1")) return "Superfractor 1/1";
+  if(t.includes("red")&&pr) return `Red${suf}`;
+  if(t.includes("orange")&&pr) return `Orange${suf}`;
+  if(t.includes("gold")&&pr) return `Gold${suf}`;
+  if(t.includes("purple")&&pr) return `Purple${suf}`;
+  if(t.includes("blue")&&pr) return `Blue${suf}`;
+  if(t.includes("green")&&pr) return `Green${suf}`;
+  if(t.includes("x-fractor")||t.includes("xfractor")) return `X-Fractor${suf}`;
+  if(t.includes("shimmer")) return `Shimmer${suf}`;
+  if(t.includes("speckle")) return `Speckle${suf}`;
+  if(t.includes("wave")) return `Wave${suf}`;
+  if(t.includes("refractor")) return `Refractor${suf}`;
+  if(pr) return `Numbered /${pr}`;
+  return "Base";
+}
+function yearInTitle(title){
+  const m = title.match(/\b(19\d{2}|20\d{2})\b/);
+  return m ? parseInt(m[1]) : null;
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+function calcStats(prices){
+  if(!prices.length) return null;
+  const sorted = [...prices].sort((a,b)=>a-b);
+  const n = sorted.length;
+  const median = n%2===1 ? sorted[Math.floor(n/2)] : (sorted[n/2-1]+sorted[n/2])/2;
+  const p25 = sorted[Math.floor(n*0.25)];
+  const p75 = sorted[Math.floor(n*0.75)];
+  const trim = Math.floor(n*0.1);
+  const trimmed = sorted.slice(trim, n-trim||undefined);
+  const mean = trimmed.reduce((a,b)=>a+b,0)/trimmed.length;
+  return {
+    count:n, median:+median.toFixed(2), mean:+mean.toFixed(2),
+    p25:+p25.toFixed(2), p75:+p75.toFixed(2),
+    min:+sorted[0].toFixed(2), max:+sorted[n-1].toFixed(2)
+  };
+}
+
+// ── Main pull function ────────────────────────────────────────────────────────
+async function pullCardPrices(playerName, token, onProgress){
+  const query = buildQuery(playerName);
+  onProgress(`Querying: ${query}`);
+
+  const html = await fetch130point(query, token);
+
+  // Token / error detection
+  const tokenErr = detect130PointTokenError(html);
+  if(tokenErr) throw Object.assign(new Error(tokenErr), {tokenError:tokenErr});
+
+  const rawSales = parseSales(html);
+  onProgress(`  Found ${rawSales.length} raw sales`);
+
+  const now = new Date();
+  const day30 = new Date(now - 30*864e5);
+  const day90 = new Date(now - 90*864e5);
+
+  // Groups: key = "auto|type|parallel"
+  const groups = {};
+  const rawComps = [];
+  let inferredYear = null;
+
+  for(const sale of rawSales){
+    const {price, title, soldDate} = sale;
+    if(!isBowman1st(title)){
+      rawComps.push({...sale, kept:false, reason:"Not Bowman 1st"}); continue;
+    }
+    const excl = isExcluded(title);
+    if(excl){
+      rawComps.push({...sale, kept:false, reason:`Excluded: ${excl}`}); continue;
+    }
+
+    const auto = isAuto(title) ? "Auto" : "Non-Auto";
+    const type = cardType(title);
+    const parallel = detectParallel(title);
+    const grade = gradeBucket(title);
+    const yr = yearInTitle(title);
+    if(yr && (!inferredYear || yr < inferredYear)) inferredYear = yr;
+
+    const key = `${auto}|${type}|${parallel}`;
+    if(!groups[key]) groups[key] = {auto, type, parallel, all:[], p30:[], p90:[], psa10:[], psa9:[], raw:[]};
+    const g = groups[key];
+    g.all.push(price);
+    if(soldDate){
+      if(soldDate >= day30) g.p30.push(price);
+      if(soldDate >= day90) g.p90.push(price);
+    }
+    if(grade==="PSA10") g.psa10.push(price);
+    else if(grade==="PSA9") g.psa9.push(price);
+    else if(grade==="RAW") g.raw.push(price);
+
+    rawComps.push({price, title, soldDate, kept:true, auto, type, parallel, grade, yr});
+  }
+
+  const lineItems = Object.values(groups).map(g => ({
+    player: playerName, query,
+    auto: g.auto, type: g.type, parallel: g.parallel,
+    inferredYear,
+    pulledAt: now.toISOString(),
+    stats: calcStats(g.all),
+    stats30: calcStats(g.p30),
+    stats90: calcStats(g.p90),
+    psa10: calcStats(g.psa10),
+    psa9: calcStats(g.psa9),
+    raw: calcStats(g.raw),
+  })).filter(li => li.stats && li.stats.count > 0);
+
+  onProgress(`  → ${lineItems.length} line items, ${rawComps.filter(r=>r.kept).length} kept comps`);
+  return {lineItems, rawComps};
+}
+
+// ── SETTINGS MODAL ────────────────────────────────────────────────────────────
+function SettingsModal({token, setToken, onClose}){
+  const [draft, setDraft] = React.useState(token);
+  const [saved, setSaved] = React.useState(false);
+  const save = () => {
+    const t = draft.trim();
+    setToken(t);
+    store.set("milb-130pt-token", t);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+  return e("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    e("div",{style:{background:"#0d0d0d",border:"1px solid #2a2a2a",borderRadius:12,padding:28,width:"100%",maxWidth:500}},
+      e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}},
+        e("h2",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:24,letterSpacing:3,color:"#fff",margin:0}},"SETTINGS"),
+        e("button",{onClick:onClose,style:{background:"none",border:"none",color:"#555",fontSize:22,cursor:"pointer",lineHeight:1}},"×")
+      ),
+
+      // 130point token
+      e("div",{style:{background:"#0a0a0a",border:"1px solid #1a1a1a",borderRadius:8,padding:16,marginBottom:16}},
+        e("p",{style:{fontFamily:"monospace",fontSize:10,letterSpacing:2,color:"#4FC3F7",margin:"0 0 8px"}},"130POINT API TOKEN"),
+        e("p",{style:{fontSize:11,color:"#555",margin:"0 0 12px",lineHeight:1.6}},
+          "Get a fresh token: go to ",
+          e("span",{style:{color:"#4FC3F7"}},"130point.com/sales"),
+          " → open browser DevTools (F12) → Network tab → search for any card → find the POST request to ",
+          e("span",{style:{color:"#4FC3F7"}},"back.130point.com/cards/"),
+          " → copy the ",
+          e("span",{style:{color:"#FFD700"}},"tk="),
+          " value from the request body."
+        ),
+        e("div",{style:{display:"flex",gap:8}},
+          e("input",{
+            value:draft,
+            onChange:ev=>setDraft(ev.target.value),
+            placeholder:"Paste token here...",
+            style:{flex:1,background:"#141414",border:`1px solid ${draft?"#4FC3F7":"#2a2a2a"}`,borderRadius:6,padding:"9px 12px",color:"#fff",fontFamily:"monospace",fontSize:12,outline:"none"}
+          }),
+          e("button",{onClick:save,style:{padding:"9px 16px",background:saved?"#1a3a1a":"#4FC3F7",border:"none",borderRadius:6,color:saved?"#4CAF50":"#000",fontFamily:"monospace",fontSize:11,letterSpacing:1,cursor:"pointer",transition:"all 0.2s",fontWeight:700}},
+            saved ? "✓ SAVED" : "SAVE"
+          )
+        ),
+        draft && e("p",{style:{fontSize:10,color:"#444",fontFamily:"monospace",margin:"8px 0 0"}},
+          `Current: ${draft.slice(0,8)}...${draft.slice(-4)} (${draft.length} chars)`
+        )
+      ),
+
+      // How to get token
+      e("div",{style:{background:"#0a0a00",border:"1px solid #2a2a00",borderRadius:8,padding:14}},
+        e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#FFD700",margin:"0 0 8px"}},"⚠ TOKEN EXPIRES PERIODICALLY"),
+        e("p",{style:{fontSize:11,color:"#665500",lineHeight:1.6,margin:0}},
+          "If card price pulls stop working, the token has expired. Re-fetch it from 130point.com using the steps above and save it here. The app will remember it across sessions."
+        )
+      ),
+
+      e("button",{onClick:onClose,style:{marginTop:16,width:"100%",padding:"10px",background:"transparent",border:"1px solid #222",borderRadius:6,color:"#666",fontFamily:"monospace",fontSize:11,letterSpacing:2,cursor:"pointer"}},"CLOSE")
+    )
+  );
+}
+
+// ── PRICES TAB ────────────────────────────────────────────────────────────────
+function PricesTab({watchlist, bios, token}){
+  const [prices, setPrices] = React.useState({});      // pid -> {lineItems, pulledAt, rawComps}
+  const [history, setHistory] = React.useState({});    // pid -> [{pulledAt, lineItems}]
+  const [pulling, setPulling] = React.useState(null);  // pid currently pulling
+  const [pullLog, setPullLog] = React.useState([]);
+  const [selected, setSelected] = React.useState(null);
+  const [viewRaw, setViewRaw] = React.useState(false);
+  const [activePlayer, setActivePlayer] = React.useState(watchlist[0]?.pid || null);
+  const [tokenError, setTokenError] = React.useState(null);
+
+  // Load persisted prices on mount
+  React.useEffect(()=>{
+    async function load(){
+      try{
+        const sp = await store.get("milb-prices");
+        const sh = await store.get("milb-price-history");
+        if(sp?.value) setPrices(JSON.parse(sp.value));
+        if(sh?.value) setHistory(JSON.parse(sh.value));
+      }catch{}
+    }
+    load();
+  },[]);
+
+  const persist = async (newPrices, newHistory) => {
+    await store.set("milb-prices", JSON.stringify(newPrices));
+    await store.set("milb-price-history", JSON.stringify(newHistory));
+  };
+
+  const pullPlayer = async (pid, name) => {
+    if(!token){
+      setTokenError("no_token");
+      return;
+    }
+    setPulling(pid);
+    setTokenError(null);
+    setPullLog([`Pulling prices for ${name}...`]);
+    try{
+      const {lineItems, rawComps} = await pullCardPrices(name, token, msg => setPullLog(prev=>[...prev, msg]));
+      const pulledAt = new Date().toISOString();
+      const entry = {lineItems, rawComps, pulledAt};
+
+      setPrices(prev => {
+        const next = {...prev, [pid]: entry};
+        // Also update history
+        setHistory(prevH => {
+          const h = prevH[pid] || [];
+          const snapshot = {pulledAt, lineItems};
+          const next2 = {...prevH, [pid]: [...h, snapshot].slice(-50)}; // keep last 50 snapshots
+          persist(next, next2);
+          return next2;
+        });
+        return next;
+      });
+      setPullLog(prev=>[...prev, `✓ Done — ${lineItems.length} line items`]);
+      setActivePlayer(pid);
+    } catch(err){
+      const te = err.tokenError;
+      if(te){
+        setTokenError(te);
+        setPullLog(prev=>[...prev, `✗ Token error: ${te}`]);
+      } else {
+        setPullLog(prev=>[...prev, `✗ Error: ${err.message}`]);
+      }
+    }
+    setPulling(null);
+  };
+
+  const enriched = watchlist.map(w => {
+    const bio = bios.find(b=>b.id===w.pid)||null;
+    const priceData = prices[w.pid] || null;
+    return {...w, bio, priceData};
+  });
+
+  const activePData = activePlayer ? prices[activePlayer] : null;
+  const activeW = watchlist.find(w=>w.pid===activePlayer);
+  const activeHistory = activePlayer ? (history[activePlayer]||[]) : [];
+
+  // Token error banner
+  const TOKEN_ERRORS = {
+    no_token: {icon:"🔑", title:"No Token Set", msg:"Open Settings (⚙) and paste your 130point token to pull card prices."},
+    invalid_token: {icon:"🔑", title:"Invalid Token", msg:"Your 130point token was rejected. It may have expired — open Settings and paste a fresh token from 130point.com."},
+    unauthorized: {icon:"🔒", title:"Unauthorized", msg:"Access denied. Your token has likely expired — open Settings and get a new one from 130point.com."},
+    expired_token: {icon:"⏱", title:"Token Expired", msg:"Your 130point token has expired. Open Settings and paste a fresh token from 130point.com."},
+    empty_response: {icon:"📭", title:"Empty Response", msg:"130point returned no data. Your token may be stale, or the service may be temporarily down. Try again shortly."},
+    no_data: {icon:"🔍", title:"No Sales Found", msg:"130point returned a response but no sale data was found. Your token may be stale — check Settings."},
+  };
+
+  return e("div",{style:{display:"flex",height:"calc(100vh - 57px)"}},
+
+    // Left: player list
+    e("div",{style:{width:280,flexShrink:0,borderRight:"1px solid #111",display:"flex",flexDirection:"column"}},
+      e("div",{style:{padding:"14px 14px 10px",borderBottom:"1px solid #111"}},
+        e("p",{style:{fontFamily:"monospace",fontSize:10,letterSpacing:2,color:"#555",margin:"0 0 2px"}},"CARD PRICES"),
+        e("p",{style:{fontSize:10,color:"#333",margin:0}},`${watchlist.length} watched players`)
+      ),
+
+      // Token error banner
+      tokenError && TOKEN_ERRORS[tokenError] && e("div",{style:{margin:"10px 10px 0",background:"#1a0a00",border:"1px solid #6a3000",borderRadius:8,padding:12}},
+        e("div",{style:{display:"flex",gap:6,alignItems:"flex-start"}},
+          e("span",{style:{fontSize:16,flexShrink:0}},TOKEN_ERRORS[tokenError].icon),
+          e("div",null,
+            e("p",{style:{fontFamily:"monospace",fontSize:10,color:"#FF9800",margin:"0 0 3px",letterSpacing:1}},TOKEN_ERRORS[tokenError].title),
+            e("p",{style:{fontSize:10,color:"#885500",margin:0,lineHeight:1.5}},TOKEN_ERRORS[tokenError].msg)
+          )
+        )
+      ),
+
+      e("div",{style:{overflowY:"auto",flex:1}},
+        enriched.map(w => {
+          const pd = w.priceData;
+          const isActive = activePlayer===w.pid;
+          const isPulling = pulling===w.pid;
+          return e("div",{key:w.pid||w.name,
+            style:{padding:"10px 14px",borderBottom:"1px solid #0f0f0f",cursor:"pointer",
+              background:isActive?"#141414":"transparent",borderLeft:`3px solid ${isActive?"#c62828":"transparent"}`},
+            onClick:()=>setActivePlayer(w.pid)},
+            e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}},
+              e("div",{style:{flex:1,minWidth:0}},
+                e("div",{style:{fontSize:12,color:"#ddd",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},w.name),
+                pd
+                  ? e("div",{style:{fontSize:9,color:"#555",fontFamily:"monospace"}},
+                      `${pd.lineItems.length} rows · ${new Date(pd.pulledAt).toLocaleDateString()}`
+                    )
+                  : e("div",{style:{fontSize:9,color:"#444",fontFamily:"monospace"}},"not pulled yet")
+              ),
+              e("button",{
+                onClick:ev=>{ev.stopPropagation();pullPlayer(w.pid,w.name);},
+                disabled:!!pulling,
+                style:{padding:"5px 8px",background:isPulling?"#141414":"#0a0a1a",border:`1px solid ${isPulling?"#222":"#4FC3F7"}`,borderRadius:5,color:isPulling?"#333":"#4FC3F7",fontSize:9,cursor:pulling?"default":"pointer",letterSpacing:1,whiteSpace:"nowrap",flexShrink:0}
+              }, isPulling?"..." : pd ? "↻" : "PULL")
+            )
+          );
+        })
+      ),
+
+      // Pull log
+      pullLog.length > 0 && e("div",{style:{borderTop:"1px solid #111",padding:10,maxHeight:120,overflowY:"auto",background:"#080808"}},
+        pullLog.map((l,i)=>e("p",{key:i,style:{fontSize:9,color:l.startsWith("✗")?"#c62828":l.startsWith("✓")?"#4CAF50":"#555",margin:"1px 0",fontFamily:"monospace"}},l))
+      )
+    ),
+
+    // Right: price detail
+    activePData && activeW
+      ? e("div",{style:{flex:1,padding:20,overflowY:"auto"}},
+          e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}},
+            e("div",null,
+              e("h2",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:28,letterSpacing:3,color:"#fff",margin:"0 0 2px"}},activeW.name),
+              e("p",{style:{color:"#555",fontSize:11,fontFamily:"monospace",margin:0}},
+                `Last pulled: ${new Date(activePData.pulledAt).toLocaleString()} · ${activePData.lineItems.length} line items · ${activePData.rawComps.filter(r=>r.kept).length} comps kept`
+              )
+            ),
+            e("div",{style:{display:"flex",gap:8}},
+              e("button",{onClick:()=>setViewRaw(!viewRaw),style:{padding:"7px 12px",background:"#141414",border:`1px solid ${viewRaw?"#FFD700":"#2a2a2a"}`,borderRadius:6,color:viewRaw?"#FFD700":"#555",fontSize:10,fontFamily:"monospace",cursor:"pointer",letterSpacing:1}},
+                viewRaw?"HIDE RAW":"VIEW RAW COMPS"
+              ),
+              e("button",{onClick:()=>pullPlayer(activeW.pid,activeW.name),disabled:!!pulling,style:{padding:"7px 12px",background:"#0a0a1a",border:"1px solid #4FC3F7",borderRadius:6,color:pulling?"#333":"#4FC3F7",fontSize:10,fontFamily:"monospace",cursor:pulling?"default":"pointer",letterSpacing:1}},
+                pulling?"PULLING...":"↻ REFRESH"
+              )
+            )
+          ),
+
+          // Line items table
+          !viewRaw && e("div",{style:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:10,padding:16,marginBottom:16}},
+            e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 12px"}},"BOWMAN 1ST · PRICE BREAKDOWN"),
+            e("div",{style:{overflowX:"auto"}},
+              e("table",{style:{width:"100%",fontSize:11,minWidth:700}},
+                e("thead",null,e("tr",{style:{background:"#0a0a0a"}},
+                  ["TYPE","PARALLEL","GRADE SPLIT","COUNT","MEDIAN","MEAN","P25","P75","30D MED","90D MED"].map(h=>
+                    e("th",{key:h,style:{padding:"6px 10px",color:"#555",fontSize:9,letterSpacing:1,textAlign:"right",borderBottom:"1px solid #1a1a1a",whiteSpace:"nowrap",textAlign:h==="TYPE"||h==="PARALLEL"||h==="GRADE SPLIT"?"left":"right"}},h)
+                  )
+                )),
+                e("tbody",null,
+                  activePData.lineItems
+                    .sort((a,b)=>b.stats.count-a.stats.count)
+                    .map((li,i)=>{
+                      const isAuto = li.auto==="Auto";
+                      return e("tr",{key:i,style:{background:i%2===0?"transparent":"#080808"}},
+                        e("td",{style:{padding:"6px 10px",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},
+                          e("div",{style:{display:"flex",gap:5,alignItems:"center"}},
+                            e("span",{style:{fontSize:9,padding:"2px 5px",borderRadius:3,background:isAuto?"#1a0a0a":"#0a0a1a",color:isAuto?"#c62828":"#4FC3F7",border:`1px solid ${isAuto?"#3a1010":"#101030"}`}},li.auto),
+                            e("span",{style:{fontSize:9,padding:"2px 5px",borderRadius:3,background:"#141414",color:"#888",border:"1px solid #222"}},li.type)
+                          )
+                        ),
+                        e("td",{style:{padding:"6px 10px",color:"#aaa",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},li.parallel),
+                        // PSA splits
+                        e("td",{style:{padding:"6px 10px",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},
+                          e("div",{style:{display:"flex",gap:6,fontSize:10}},
+                            li.psa10?.count ? e("span",{style:{color:"#FFD700"}},`PSA10: $${li.psa10.median} (${li.psa10.count})`) : null,
+                            li.psa9?.count ? e("span",{style:{color:"#C0C0C0"}},`PSA9: $${li.psa9.median} (${li.psa9.count})`) : null,
+                            li.raw?.count ? e("span",{style:{color:"#888"}},`Raw: $${li.raw.median} (${li.raw.count})`) : null
+                          )
+                        ),
+                        e("td",{style:{padding:"6px 10px",color:"#ddd",borderBottom:"1px solid #111",textAlign:"right"}},li.stats.count),
+                        e("td",{style:{padding:"6px 10px",color:"#4CAF50",borderBottom:"1px solid #111",textAlign:"right",fontWeight:700}},`$${li.stats.median}`),
+                        e("td",{style:{padding:"6px 10px",color:"#aaa",borderBottom:"1px solid #111",textAlign:"right"}},`$${li.stats.mean}`),
+                        e("td",{style:{padding:"6px 10px",color:"#555",borderBottom:"1px solid #111",textAlign:"right"}},`$${li.stats.p25}`),
+                        e("td",{style:{padding:"6px 10px",color:"#555",borderBottom:"1px solid #111",textAlign:"right"}},`$${li.stats.p75}`),
+                        e("td",{style:{padding:"6px 10px",color:li.stats30?.count?"#4FC3F7":"#333",borderBottom:"1px solid #111",textAlign:"right"}},li.stats30?.count?`$${li.stats30.median}`:"—"),
+                        e("td",{style:{padding:"6px 10px",color:li.stats90?.count?"#9C27B0":"#333",borderBottom:"1px solid #111",textAlign:"right"}},li.stats90?.count?`$${li.stats90.median}`:"—")
+                      );
+                    })
+                )
+              )
+            )
+          ),
+
+          // Price history
+          !viewRaw && activeHistory.length > 1 && e("div",{style:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:10,padding:16,marginBottom:16}},
+            e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 12px"}},"PRICE HISTORY"),
+            e("div",{style:{overflowX:"auto"}},
+              e("table",{style:{width:"100%",fontSize:10,minWidth:500}},
+                e("thead",null,e("tr",null,
+                  ["PULLED","TYPE","PARALLEL","COUNT","MEDIAN","30D","90D"].map(h=>
+                    e("th",{key:h,style:{padding:"5px 8px",color:"#444",fontSize:8,letterSpacing:1,textAlign:"right",borderBottom:"1px solid #1a1a1a",textAlign:h==="TYPE"||h==="PARALLEL"?"left":"right"}},h)
+                  )
+                )),
+                e("tbody",null,
+                  // Show last 20 snapshots, most recent first
+                  [...activeHistory].reverse().slice(0,20).flatMap((snap,si) =>
+                    snap.lineItems.map((li,i) =>
+                      e("tr",{key:`${si}-${i}`,style:{background:i%2===0&&si%2===0?"transparent":"#080808"}},
+                        e("td",{style:{padding:"4px 8px",color:"#555",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},
+                          new Date(snap.pulledAt).toLocaleDateString()
+                        ),
+                        e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},
+                          e("span",{style:{fontSize:9,color:li.auto==="Auto"?"#c62828":"#4FC3F7"}},`${li.auto} ${li.type}`)
+                        ),
+                        e("td",{style:{padding:"4px 8px",color:"#666",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},li.parallel),
+                        e("td",{style:{padding:"4px 8px",color:"#aaa",borderBottom:"1px solid #111",textAlign:"right"}},li.stats?.count||"—"),
+                        e("td",{style:{padding:"4px 8px",color:"#4CAF50",borderBottom:"1px solid #111",textAlign:"right",fontWeight:600}},li.stats?.median?`$${li.stats.median}`:"—"),
+                        e("td",{style:{padding:"4px 8px",color:"#4FC3F7",borderBottom:"1px solid #111",textAlign:"right"}},li.stats30?.median?`$${li.stats30.median}`:"—"),
+                        e("td",{style:{padding:"4px 8px",color:"#9C27B0",borderBottom:"1px solid #111",textAlign:"right"}},li.stats90?.median?`$${li.stats90.median}`:"—")
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          ),
+
+          // Raw comps
+          viewRaw && e("div",{style:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:10,padding:16}},
+            e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 12px"}},
+              `RAW COMPS — ${activePData.rawComps.length} total · ${activePData.rawComps.filter(r=>r.kept).length} kept · ${activePData.rawComps.filter(r=>!r.kept).length} excluded`
+            ),
+            e("div",{style:{overflowX:"auto"}},
+              e("table",{style:{width:"100%",fontSize:10,minWidth:600}},
+                e("thead",null,e("tr",null,
+                  ["KEPT","PRICE","DATE","GRADE","TYPE","PARALLEL","TITLE"].map(h=>
+                    e("th",{key:h,style:{padding:"5px 8px",color:"#444",fontSize:8,letterSpacing:1,textAlign:"left",borderBottom:"1px solid #1a1a1a",whiteSpace:"nowrap"}},h)
+                  )
+                )),
+                e("tbody",null,
+                  activePData.rawComps.slice(0,200).map((c,i)=>
+                    e("tr",{key:i,style:{background:c.kept?(i%2===0?"transparent":"#080808"):"#0a0500",opacity:c.kept?1:0.5}},
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},e("span",{style:{color:c.kept?"#4CAF50":"#c62828",fontSize:11}},c.kept?"✓":"✗")),
+                      e("td",{style:{padding:"4px 8px",color:"#4CAF50",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontWeight:600}},`$${c.price.toFixed(2)}`),
+                      e("td",{style:{padding:"4px 8px",color:"#555",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.soldDate?new Date(c.soldDate).toLocaleDateString():"—"),
+                      e("td",{style:{padding:"4px 8px",color:"#888",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.grade||"—"),
+                      e("td",{style:{padding:"4px 8px",color:"#888",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.type||(c.kept?"":c.reason)||"—"),
+                      e("td",{style:{padding:"4px 8px",color:"#666",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.parallel||"—"),
+                      e("td",{style:{padding:"4px 8px",color:"#aaa",borderBottom:"1px solid #111",fontSize:10,maxWidth:280,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},c.title||"—")
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      : e("div",{style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16,color:"#2a2a2a"}},
+          e("div",{style:{fontSize:48}},"💰"),
+          e("p",{style:{fontFamily:"monospace",fontSize:11,letterSpacing:2,textAlign:"center",lineHeight:2}},
+            activeW
+              ? "CLICK PULL TO FETCH PRICES\nFOR THIS PLAYER"
+              : "SELECT A PLAYER\nFROM YOUR WATCHLIST"
+          )
+        )
+  );
+}
+
 // ── ROOT ──────────────────────────────────────────────────────────────────────
-const TABS=["WATCHLIST","PROSPECTS","STATCAST","FANGRAPHS","CARD GRADER"];
+const TABS=["WATCHLIST","PROSPECTS","STATCAST","FANGRAPHS","PRICES","CARD GRADER"];
 
 function App(){
   const [tab,setTab]=useState(0);
@@ -787,6 +1353,8 @@ function App(){
   const [loadMsg,setLoadMsg]=useState("Decompressing data...");
   const [loadPct,setLoadPct]=useState(0);
   const [refreshing,setRefreshing]=useState(false);
+  const [token,setToken]=useState("");
+  const [showSettings,setShowSettings]=useState(false);
   const [refreshLog,setRefreshLog]=useState([]);
   const fgRef=useRef();
 
@@ -833,6 +1401,8 @@ function App(){
           setBios(rawBios);setHitting(allHit);setStatcast(rawSc);setFg(rawFg);
         }
 
+        // Load saved token
+        try{const st=await store.get("milb-130pt-token");if(st?.value)setToken(st.value);}catch{}
         setLoadPct(100);setLoadMsg("Ready!");
         setTimeout(()=>setReady(true),200);
       }catch(err){setLoadMsg("Error: "+err.message);}
@@ -981,6 +1551,7 @@ function App(){
         t+(i===0&&watchlist.length>0?` (${watchlist.length})`:"")))
       ,
       e("div",{style:{flex:1}}),
+      e("button",{onClick:()=>setShowSettings(true),title:"Settings",style:{padding:"0 12px",background:"transparent",border:"none",borderLeft:"1px solid #111",color:"#555",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",height:"100%"}},"⚙"),
       e("div",{style:{display:"flex",alignItems:"center",gap:8,fontSize:9,color:"#333",paddingLeft:12}},
         e("span",null,`${bios.length.toLocaleString()} prospects`),
         e("span",null,"·"),
@@ -999,7 +1570,9 @@ function App(){
     tab===1&&e(ProspectsTab,{bios,hitting,onAddToWatchlist,onLiveRefreshAll:handleLiveRefreshAll,refreshing}),
     tab===2&&e(StatcastTab,{statcast,bios,onImportStatcast:handleImportStatcast}),
     tab===3&&e(React.Fragment,null,e("input",{ref:fgRef,type:"file",accept:".csv",style:{display:"none"},onChange:handleFgImport}),e(FangraphsTab,{fg,onImport:()=>fgRef.current.click()})),
-    tab===4&&e(CardGraderTab,{initialPlayer:gradeTarget})
+    tab===4&&e(PricesTab,{watchlist,bios,token}),
+    tab===5&&e(CardGraderTab,{initialPlayer:gradeTarget}),
+    showSettings&&e(SettingsModal,{token,setToken,onClose:()=>setShowSettings(false)})
   );
 }
 
