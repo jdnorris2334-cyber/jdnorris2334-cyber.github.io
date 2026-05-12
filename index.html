@@ -246,7 +246,7 @@ function StatBox({label,value,color="#ddd"}){
 }
 
 // ── WATCHLIST TAB ─────────────────────────────────────────────────────────────
-function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer}){
+function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer,onJump}){
   const [adding,setAdding]=useState(false);
   const [addSearch,setAddSearch]=useState("");
   const [refreshingPid,setRefreshingPid]=useState(null);
@@ -306,7 +306,7 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
         e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10,marginBottom:12}},
           e("div",{style:{flex:1}},
             e("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:5,flexWrap:"wrap"}},
-              e("h3",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:22,letterSpacing:2,color:"#fff",margin:0}},w.name),
+              e("h3",{onClick:()=>onJump&&onJump({...w,pid:w.pid}),style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:22,letterSpacing:2,color:"#fff",margin:0,cursor:"pointer",borderBottom:"1px solid transparent"},onMouseEnter:ev=>ev.currentTarget.style.borderBottomColor="#c62828",onMouseLeave:ev=>ev.currentTarget.style.borderBottomColor="transparent"},w.name),
               w.bio&&e(React.Fragment,null,e(Pill,{label:w.bio.pos}),e(Pill,{label:w.bio.lvl,color:LVL_COLOR[w.bio.lvl]||"#555"})),
               w.bio?.fv&&e(Pill,{label:`FV ${w.bio.fv}`,color:fvColor(w.bio.fv)}),
               w.bio?.fr&&e(Pill,{label:`#${Math.round(w.bio.fr)} FG`,color:"#4FC3F7"})
@@ -364,7 +364,7 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
 }
 
 // ── PROSPECTS TAB ─────────────────────────────────────────────────────────────
-function ProspectsTab({bios,hitting,onAddToWatchlist,onLiveRefreshAll,refreshing}){
+function ProspectsTab({bios,hitting,onAddToWatchlist,onLiveRefreshAll,refreshing,autoSelectId,onJump}){
   const [search,setSearch]=useState("");
   const [filterOrg,setFilterOrg]=useState("");
   const [filterLvl,setFilterLvl]=useState("");
@@ -392,6 +392,13 @@ function ProspectsTab({bios,hitting,onAddToWatchlist,onLiveRefreshAll,refreshing
   },[bios,search,filterOrg,filterLvl,filterPos,sortBy]);
 
   useEffect(()=>setPage(0),[search,filterOrg,filterLvl,filterPos,sortBy]);
+
+  // Auto-select player when jumped from another tab
+  useEffect(()=>{
+    if(!autoSelectId||!bios.length) return;
+    const found = bios.find(b=>b.id===autoSelectId||b.id===String(autoSelectId));
+    if(found) setSelected(found);
+  },[autoSelectId, bios]);
   const pageData=filtered.slice(page*PER,(page+1)*PER);
   const totalPages=Math.ceil(filtered.length/PER);
   const playerHitting=useMemo(()=>selected?hitting.filter(h=>h.id===selected.id).sort((a,b)=>b.yr-a.yr):[],[selected,hitting]);
@@ -432,7 +439,7 @@ function ProspectsTab({bios,hitting,onAddToWatchlist,onLiveRefreshAll,refreshing
               p.fr&&e("span",{style:{fontSize:9,color:"#444",width:26,textAlign:"right",flexShrink:0}},`#${Math.round(p.fr)}`),
               e("div",null,
                 e("div",{style:{display:"flex",alignItems:"center",gap:5}},
-                  e("div",{style:{fontSize:12,color:"#ddd"}},p.n),
+                  e("div",{onClick:ev=>{ev.stopPropagation();onJump&&onJump({...p,pid:p.id,name:p.n});},style:{fontSize:12,color:"#ddd",cursor:"pointer",display:"inline"},onMouseEnter:ev=>ev.currentTarget.style.color="#4FC3F7",onMouseLeave:ev=>ev.currentTarget.style.color="#ddd"},p.n),
                   p.liveRefreshed&&e("span",{style:{fontSize:8,color:"#4FC3F7"}},`✓`)
                 ),
                 e("div",{style:{fontSize:9,color:"#555"}},`${p.pos} · ${p.org}`)
@@ -454,7 +461,7 @@ function ProspectsTab({bios,hitting,onAddToWatchlist,onLiveRefreshAll,refreshing
     selected?e("div",{style:{flex:1,padding:24,overflowY:"auto"}},
       e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}},
         e("div",null,
-          e("h2",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:32,letterSpacing:3,color:"#fff",margin:"0 0 6px"}},selected.n),
+          e("h2",{onClick:()=>onJump&&onJump({...selected,pid:selected.id,name:selected.n}),style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:32,letterSpacing:3,color:"#fff",margin:"0 0 6px",cursor:"pointer",display:"inline-block"},onMouseEnter:ev=>ev.currentTarget.style.color="#4FC3F7",onMouseLeave:ev=>ev.currentTarget.style.color="#fff"},selected.n),
           e("div",{style:{display:"flex",gap:6,flexWrap:"wrap"}},
             e(Pill,{label:selected.pos}),e(Pill,{label:selected.lvl,color:LVL_COLOR[selected.lvl]||"#555"}),e(Pill,{label:selected.org}),
             selected.fv&&e(Pill,{label:`FV ${selected.fv}`,color:fvColor(selected.fv)}),
@@ -499,7 +506,7 @@ function ProspectsTab({bios,hitting,onAddToWatchlist,onLiveRefreshAll,refreshing
 }
 
 // ── STATCAST TAB ──────────────────────────────────────────────────────────────
-function StatcastTab({statcast,bios,onImportStatcast}){
+function StatcastTab({statcast,bios,onImportStatcast,autoFilter,onJump}){
   const [search,setSearch]=useState("");
   const [sortBy,setSortBy]=useState("ev");
   const [minBB,setMinBB]=useState(10);
@@ -510,6 +517,12 @@ function StatcastTab({statcast,bios,onImportStatcast}){
     const dn=s.n.split(",").map(p=>p.trim()).reverse().join(" ");
     return{...s,dn,bio:bios.find(b=>norm(b.n)===norm(dn))};
   }),[statcast,bios]);
+
+  // Auto-filter when jumped from another tab
+  useEffect(()=>{
+    if(!autoFilter) return;
+    setSearch(autoFilter);
+  },[autoFilter]);
 
   const filtered=useMemo(()=>{
     let r=enriched.filter(s=>(s.bb||0)>=minBB);
@@ -590,7 +603,7 @@ function StatcastTab({statcast,bios,onImportStatcast}){
           COLS.map(c=>e("th",{key:c.key,onClick:()=>setSortBy(c.key),style:{padding:"8px 10px",color:sortBy===c.key?c.color:"#555",fontSize:9,letterSpacing:1,textAlign:"right",borderBottom:"1px solid #1a1a1a",cursor:"pointer",whiteSpace:"nowrap"}},c.label+(sortBy===c.key?" ▼":"")))
         )),
         e("tbody",null,filtered.slice(0,150).map((s,i)=>e("tr",{key:i,style:{background:i%2===0?"transparent":"#080808"}},
-          e("td",{style:{padding:"5px 12px",color:"#ddd",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},s.dn),
+          e("td",{style:{padding:"5px 12px",color:"#ddd",borderBottom:"1px solid #111",whiteSpace:"nowrap",cursor:"pointer"},onClick:()=>onJump&&onJump({...s,pid:s.id||s.batter,name:s.dn}),onMouseEnter:ev=>ev.currentTarget.style.color="#4FC3F7",onMouseLeave:ev=>ev.currentTarget.style.color="#ddd"},s.dn),
           e("td",{style:{padding:"5px 8px",color:"#555",borderBottom:"1px solid #111",fontSize:10}},s.yr),
           e("td",{style:{padding:"5px 12px",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},
             s.bio?e("div",{style:{display:"flex",gap:4,alignItems:"center"}},e("span",{style:{color:"#555",fontSize:10}},s.bio.org),e(Tag,{label:lvlShort(s.bio.lvl),color:LVL_COLOR[s.bio.lvl]||"#555"})):e("span",{style:{color:"#333",fontSize:10}},"—")
@@ -604,7 +617,7 @@ function StatcastTab({statcast,bios,onImportStatcast}){
 }
 
 // ── FANGRAPHS TAB ─────────────────────────────────────────────────────────────
-function FangraphsTab({fg,onImport}){
+function FangraphsTab({fg,onImport,onJump}){
   const [search,setSearch]=useState("");
   const [filterOrg,setFilterOrg]=useState("");
   const [filterPos,setFilterPos]=useState("");
@@ -637,7 +650,7 @@ function FangraphsTab({fg,onImport}){
         e("thead",null,e("tr",{style:{background:"#0d0d0d"}},["RK","NAME","POS","ORG","AGE","HIT","GAME PWR","RAW PWR","SPD","FLD","STYLE","FV"].map(h=>e("th",{key:h,style:{padding:"8px 10px",color:"#555",fontSize:9,letterSpacing:1,textAlign:"left",borderBottom:"1px solid #1a1a1a",whiteSpace:"nowrap"}},h)))),
         e("tbody",null,filtered.map((p,i)=>e("tr",{key:i,style:{background:i%2===0?"transparent":"#080808"}},
           e("td",{style:{padding:"6px 10px",color:"#555",fontSize:10,borderBottom:"1px solid #111"}},p.rk?Math.round(p.rk):"—"),
-          e("td",{style:{padding:"6px 10px",color:"#ddd",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontWeight:600}},p.n),
+          e("td",{style:{padding:"6px 10px",color:"#ddd",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontWeight:600,cursor:"pointer"},onClick:()=>onJump&&onJump({...p,name:p.n}),onMouseEnter:ev=>ev.currentTarget.style.color="#4FC3F7",onMouseLeave:ev=>ev.currentTarget.style.color="#ddd"},p.n),
           e("td",{style:{padding:"6px 10px",color:"#888",borderBottom:"1px solid #111"}},p.pos),
           e("td",{style:{padding:"6px 10px",color:"#888",borderBottom:"1px solid #111"}},p.org),
           e("td",{style:{padding:"6px 10px",color:"#888",borderBottom:"1px solid #111"}},p.age?Number(p.age).toFixed(1):"—"),
@@ -1058,7 +1071,7 @@ function SettingsModal({token, setToken, onClose}){
 }
 
 // ── PRICES TAB ────────────────────────────────────────────────────────────────
-function PricesTab({watchlist, bios, token}){
+function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
   const [prices, setPrices] = React.useState({});      // pid -> {lineItems, pulledAt, rawComps}
   const [history, setHistory] = React.useState({});    // pid -> [{pulledAt, lineItems}]
   const [pulling, setPulling] = React.useState(null);  // pid currently pulling
@@ -1079,6 +1092,26 @@ function PricesTab({watchlist, bios, token}){
       }catch{}
     }
     load();
+  },[]);
+
+  // Listen for price updates from Update All
+  React.useEffect(()=>{
+    const handler = ev => {
+      const {pid, entry} = ev.detail;
+      setPrices(prev => {
+        const next = {...prev, [pid]: entry};
+        setHistory(prevH => {
+          const h = prevH[pid]||[];
+          const snap = {pulledAt:entry.pulledAt, lineItems:entry.lineItems};
+          const next2 = {...prevH, [pid]:[...h,snap].slice(-50)};
+          persist(next, next2);
+          return next2;
+        });
+        return next;
+      });
+    };
+    window.addEventListener("milb-price-update", handler);
+    return ()=>window.removeEventListener("milb-price-update", handler);
   },[]);
 
   const persist = async (newPrices, newHistory) => {
@@ -1176,7 +1209,7 @@ function PricesTab({watchlist, bios, token}){
             onClick:()=>setActivePlayer(w.pid)},
             e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}},
               e("div",{style:{flex:1,minWidth:0}},
-                e("div",{style:{fontSize:12,color:"#ddd",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},w.name),
+                e("div",{style:{fontSize:12,color:"#ddd",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",cursor:"pointer"},onClick:ev=>{ev.stopPropagation();onJump&&onJump({...w});},onMouseEnter:ev=>ev.currentTarget.style.color="#4FC3F7",onMouseLeave:ev=>ev.currentTarget.style.color="#ddd"},w.name),
                 pd
                   ? e("div",{style:{fontSize:9,color:"#555",fontFamily:"monospace"}},
                       `${pd.lineItems.length} rows · ${new Date(pd.pulledAt).toLocaleDateString()}`
@@ -1338,6 +1371,61 @@ function PricesTab({watchlist, bios, token}){
   );
 }
 
+
+// ── Player Jump Menu ─────────────────────────────────────────────────────────
+// TAB INDICES: 0=Watchlist 1=Prospects 2=Statcast 3=FanGraphs 4=Prices 5=CardGrader
+const TAB_IDX = {WATCHLIST:0,PROSPECTS:1,STATCAST:2,FANGRAPHS:3,PRICES:4,CARD_GRADER:5};
+
+function JumpMenu({player, currentTab, onJump, onClose, watchlist}){
+  const isWatched = watchlist && player?.pid && watchlist.find(w=>w.pid===player.pid);
+  const DESTINATIONS = [
+    {tab:TAB_IDX.WATCHLIST,  label:"Watchlist",   icon:"📋", desc:"View card & stats",    show: !!isWatched},
+    {tab:TAB_IDX.PROSPECTS,  label:"Prospects",   icon:"🔍", desc:"Full bio & history",   show: !!player?.pid || !!player?.id},
+    {tab:TAB_IDX.STATCAST,   label:"Statcast",    icon:"⚡", desc:"Power metrics",        show: !!player?.pid || !!player?.id},
+    {tab:TAB_IDX.FANGRAPHS,  label:"FanGraphs",   icon:"📊", desc:"Scouting grades",      show: !!player?.name || !!player?.n},
+    {tab:TAB_IDX.PRICES,     label:"Prices",      icon:"💰", desc:"Card sales & history", show: !!isWatched},
+    {tab:TAB_IDX.CARD_GRADER,label:"Card Grader", icon:"⚾", desc:"Grade a card",         show: true},
+  ].filter(d => d.show && d.tab !== currentTab);
+
+  // Click outside to close
+  const overlayRef = React.useRef();
+  React.useEffect(()=>{
+    const handler = e => { if(overlayRef.current && !overlayRef.current.contains(e.target)) onClose(); };
+    document.addEventListener("mousedown", handler);
+    return ()=>document.removeEventListener("mousedown", handler);
+  },[onClose]);
+
+  const name = player?.name || player?.n || player?.displayName || "Player";
+
+  return e("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",zIndex:500,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
+    e("div",{ref:overlayRef,style:{background:"#0d0d0d",border:"1px solid #2a2a2a",borderRadius:12,padding:20,width:"100%",maxWidth:340,boxShadow:"0 8px 40px rgba(0,0,0,0.8)"}},
+      // Header
+      e("div",{style:{marginBottom:16}},
+        e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#555",margin:"0 0 4px"}},"JUMP TO"),
+        e("h3",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:22,letterSpacing:2,color:"#fff",margin:0}},name)
+      ),
+      // Destination buttons
+      e("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+        DESTINATIONS.map(d=>e("button",{key:d.tab,onClick:()=>{onJump(d.tab, player);onClose();},
+          style:{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"#141414",
+            border:"1px solid #222",borderRadius:8,cursor:"pointer",textAlign:"left",width:"100%",
+            transition:"all 0.15s"},
+          onMouseEnter:ev=>{ev.currentTarget.style.background="#1e1e1e";ev.currentTarget.style.borderColor="#444";},
+          onMouseLeave:ev=>{ev.currentTarget.style.background="#141414";ev.currentTarget.style.borderColor="#222";}},
+          e("span",{style:{fontSize:20,flexShrink:0}},d.icon),
+          e("div",null,
+            e("div",{style:{fontSize:13,color:"#fff",fontFamily:"monospace",letterSpacing:1}},d.label),
+            e("div",{style:{fontSize:10,color:"#555",marginTop:1}},d.desc)
+          ),
+          e("div",{style:{marginLeft:"auto",color:"#333",fontSize:14}}, "→")
+        ))
+      ),
+      // Cancel
+      e("button",{onClick:onClose,style:{marginTop:12,width:"100%",padding:"8px",background:"transparent",border:"1px solid #1a1a1a",borderRadius:6,color:"#444",fontSize:10,fontFamily:"monospace",letterSpacing:2,cursor:"pointer"}},"CANCEL")
+    )
+  );
+}
+
 // ── ROOT ──────────────────────────────────────────────────────────────────────
 const TABS=["WATCHLIST","PROSPECTS","STATCAST","FANGRAPHS","PRICES","CARD GRADER"];
 
@@ -1355,6 +1443,13 @@ function App(){
   const [refreshing,setRefreshing]=useState(false);
   const [token,setToken]=useState("");
   const [showSettings,setShowSettings]=useState(false);
+  const [tokenHealth,setTokenHealth]=useState("unknown"); // "unknown"|"ok"|"error"|"stale"
+  const [updateAllRunning,setUpdateAllRunning]=useState(false);
+  const [jumpMenu,setJumpMenu]=useState(null); // {player, currentTab}
+  const [prospectFilter,setProspectFilter]=useState(null); // player to highlight/select in Prospects
+  const [statcastFilter,setStatcastFilter]=useState(null); // player name to filter in Statcast
+  const [updateAllStatus,setUpdateAllStatus]=useState({}); // pid -> {stats,prices}
+  const [showUpdatePanel,setShowUpdatePanel]=useState(false);
   const [refreshLog,setRefreshLog]=useState([]);
   const fgRef=useRef();
 
@@ -1522,7 +1617,99 @@ function App(){
     reader.readAsText(file);
   };
 
-  const onGrade=player=>{setGradeTarget(player);setTab(4);};
+  // ── Token health check ──────────────────────────────────────────────────
+  const checkTokenHealth = React.useCallback(async(tk) => {
+    if(!tk){ setTokenHealth("error"); return "error"; }
+    setTokenHealth("unknown");
+    try{
+      // Test with a lightweight query - just check we get back valid data
+      const body = new URLSearchParams({
+        query:"Bowman Chrome", sort:"date", mp:"eBay", tab_id:"1",
+        tz:"America/Chicago", width:"400", height:"800", tk
+      });
+      const res = await fetch("https://back.130point.com/cards/", {
+        method:"POST",
+        headers:{"Content-Type":"application/x-www-form-urlencoded","Referer":"https://130point.com/sales/","Origin":"https://130point.com"},
+        body: body.toString()
+      });
+      if(!res.ok){ setTokenHealth("error"); return "error"; }
+      const html = await res.text();
+      const err = detect130PointTokenError(html);
+      if(err && err !== "no_data"){ setTokenHealth("stale"); return "stale"; }
+      setTokenHealth("ok"); return "ok";
+    }catch{ setTokenHealth("error"); return "error"; }
+  }, []);
+
+  // Check token health whenever token changes
+  React.useEffect(()=>{ if(token) checkTokenHealth(token); else setTokenHealth("error"); },[token]);
+
+  // ── Update All ───────────────────────────────────────────────────────────
+  const handleUpdateAll = async() => {
+    if(updateAllRunning) return;
+    setUpdateAllRunning(true);
+    setShowUpdatePanel(true);
+    const initStatus = {};
+    watchlist.forEach(w => { initStatus[w.pid||w.name] = {stats:"queued", prices: token?"queued":"skipped"}; });
+    setUpdateAllStatus({...initStatus});
+
+    for(const w of watchlist){
+      const key = w.pid||w.name;
+
+      // Stats refresh
+      setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],stats:"running"}}));
+      try{
+        await handleRefreshPlayer(w.pid);
+        setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],stats:"ok"}}));
+      }catch{
+        setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],stats:"error"}}));
+      }
+
+      // Price pull
+      if(token && tokenHealth==="ok"){
+        setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:"running"}}));
+        try{
+          // Re-use pullCardPrices directly and update prices state
+          const {lineItems, rawComps} = await pullCardPrices(w.name, token, ()=>{});
+          const pulledAt = new Date().toISOString();
+          const entry = {lineItems, rawComps, pulledAt};
+          // Update price state — dispatch custom event for PricesTab to pick up
+          window.__milbPriceUpdate = window.__milbPriceUpdate||{};
+          window.__milbPriceUpdate[w.pid] = entry;
+          window.dispatchEvent(new CustomEvent("milb-price-update", {detail:{pid:w.pid, entry}}));
+          setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:"ok"}}));
+        }catch(err){
+          const isToken = err.tokenError;
+          setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:isToken?"token_error":"error"}}));
+          if(isToken){ setTokenHealth("stale"); break; } // stop price pulls if token died
+        }
+      } else if(!token){
+        setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:"skipped"}}));
+      }
+    }
+    setUpdateAllRunning(false);
+  };
+
+  // ── Cross-tab jump handler ───────────────────────────────────────────────
+  const handleJump = React.useCallback((destTab, player) => {
+    setTab(destTab);
+    if(destTab === TAB_IDX.PROSPECTS){
+      // Pass player to auto-select in Prospects
+      setProspectFilter(player?.pid || player?.id || null);
+    }
+    if(destTab === TAB_IDX.STATCAST){
+      // Pass player name to filter Statcast
+      const dn = player?.name || player?.n || player?.displayName || "";
+      // Statcast names are "Last, First" format
+      const parts = dn.split(" ");
+      const scName = parts.length > 1 ? parts.slice(1).join(" ")+", "+parts[0] : dn;
+      setStatcastFilter(dn); // pass natural name, Statcast tab will handle matching
+    }
+    if(destTab === TAB_IDX.CARD_GRADER){
+      setGradeTarget(player);
+    }
+  },[]);
+
+  const onGrade=player=>{setGradeTarget(player);setTab(5);};
   const onAddToWatchlist=player=>{
     if(watchlist.find(w=>w.pid===player.id))return;
     setWatchlist(w=>[...w,{name:player.n,pid:player.id}]);
@@ -1552,11 +1739,32 @@ function App(){
       ,
       e("div",{style:{flex:1}}),
       e("button",{onClick:()=>setShowSettings(true),title:"Settings",style:{padding:"0 12px",background:"transparent",border:"none",borderLeft:"1px solid #111",color:"#555",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",height:"100%"}},"⚙"),
-      e("div",{style:{display:"flex",alignItems:"center",gap:8,fontSize:9,color:"#333",paddingLeft:12}},
-        e("span",null,`${bios.length.toLocaleString()} prospects`),
-        e("span",null,"·"),
-        e("span",null,`${hitting.length.toLocaleString()} rows`),
-        refreshing&&e("span",{style:{color:"#4FC3F7",animation:"pulse 1s infinite"}},"● LIVE PULL")
+      e("div",{style:{display:"flex",alignItems:"center",gap:10,paddingLeft:12}},
+        // Data counts
+        e("div",{style:{display:"flex",alignItems:"center",gap:6,fontSize:9,color:"#333"}},
+          e("span",null,`${bios.length.toLocaleString()} prospects`),
+          e("span",null,"·"),
+          e("span",null,`${hitting.length.toLocaleString()} rows`),
+          refreshing&&e("span",{style:{color:"#4FC3F7",fontSize:9,animation:"pulse 1s infinite"}},"● LIVE PULL")
+        ),
+        // Token health indicator
+        token && e("div",{title:`130point token: ${tokenHealth}`,style:{display:"flex",alignItems:"center",gap:4,fontSize:9,cursor:"default"}},
+          e("span",{style:{
+            width:7,height:7,borderRadius:"50%",display:"inline-block",flexShrink:0,
+            background:tokenHealth==="ok"?"#4CAF50":tokenHealth==="stale"?"#FF9800":tokenHealth==="error"?"#F44336":"#555",
+            boxShadow:tokenHealth==="ok"?"0 0 4px #4CAF50":tokenHealth==="stale"?"0 0 4px #FF9800":"none"
+          }}),
+          e("span",{style:{color:tokenHealth==="ok"?"#4CAF50":tokenHealth==="stale"?"#FF9800":tokenHealth==="error"?"#F44336":"#555"}},
+            tokenHealth==="ok"?"TOKEN OK":tokenHealth==="stale"?"TOKEN STALE":tokenHealth==="error"?"TOKEN ERROR":"CHECKING..."
+          )
+        ),
+        // Update All button
+        e("button",{
+          onClick:handleUpdateAll,
+          disabled:updateAllRunning,
+          title:"Refresh stats + prices for all watchlist players",
+          style:{padding:"4px 10px",background:updateAllRunning?"#141414":"#0a1a0a",border:`1px solid ${updateAllRunning?"#222":"#4CAF50"}`,borderRadius:5,color:updateAllRunning?"#333":"#4CAF50",fontSize:9,cursor:updateAllRunning?"default":"pointer",letterSpacing:1,whiteSpace:"nowrap",fontFamily:"monospace"}
+        }, updateAllRunning?"UPDATING...":"↻ UPDATE ALL")
       )
     ),
 
@@ -1566,13 +1774,46 @@ function App(){
       refreshLog.map((l,i)=>e("p",{key:i,style:{fontSize:10,color:"#888",margin:"2px 0",fontFamily:"monospace"}},l))
     ),
 
-    tab===0&&e(WatchlistTab,{watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer:handleRefreshPlayer}),
-    tab===1&&e(ProspectsTab,{bios,hitting,onAddToWatchlist,onLiveRefreshAll:handleLiveRefreshAll,refreshing}),
-    tab===2&&e(StatcastTab,{statcast,bios,onImportStatcast:handleImportStatcast}),
-    tab===3&&e(React.Fragment,null,e("input",{ref:fgRef,type:"file",accept:".csv",style:{display:"none"},onChange:handleFgImport}),e(FangraphsTab,{fg,onImport:()=>fgRef.current.click()})),
-    tab===4&&e(PricesTab,{watchlist,bios,token}),
+    tab===0&&e(WatchlistTab,{watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer:handleRefreshPlayer,onJump:(p)=>setJumpMenu({player:p,currentTab:0})}),
+    tab===1&&e(ProspectsTab,{bios,hitting,onAddToWatchlist,onLiveRefreshAll:handleLiveRefreshAll,refreshing,autoSelectId:prospectFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:1})}),
+    tab===2&&e(StatcastTab,{statcast,bios,onImportStatcast:handleImportStatcast,autoFilter:statcastFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:2})}),
+    tab===3&&e(React.Fragment,null,e("input",{ref:fgRef,type:"file",accept:".csv",style:{display:"none"},onChange:handleFgImport}),e(FangraphsTab,{fg,onImport:()=>fgRef.current.click(),onJump:(p)=>setJumpMenu({player:p,currentTab:3})})),
+    tab===4&&e(PricesTab,{watchlist,bios,token,tokenHealth,onJump:(p)=>setJumpMenu({player:p,currentTab:4})}),
     tab===5&&e(CardGraderTab,{initialPlayer:gradeTarget}),
-    showSettings&&e(SettingsModal,{token,setToken,onClose:()=>setShowSettings(false)})
+    showSettings&&e(SettingsModal,{token,setToken,onClose:()=>setShowSettings(false)}),
+    jumpMenu&&e(JumpMenu,{player:jumpMenu.player,currentTab:jumpMenu.currentTab,watchlist,onJump:handleJump,onClose:()=>setJumpMenu(null)}),
+    showUpdatePanel&&e("div",{style:{position:"fixed",bottom:20,right:20,background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:10,padding:16,zIndex:200,width:320,boxShadow:"0 4px 24px rgba(0,0,0,0.6)"}},
+      e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}},
+        e("p",{style:{fontFamily:"monospace",fontSize:10,letterSpacing:2,color:"#4CAF50",margin:0}},updateAllRunning?"↻ UPDATING ALL...":"✓ UPDATE COMPLETE"),
+        !updateAllRunning&&e("button",{onClick:()=>setShowUpdatePanel(false),style:{background:"none",border:"none",color:"#555",fontSize:16,cursor:"pointer",lineHeight:1}},"×")
+      ),
+      e("div",{style:{display:"flex",flexDirection:"column",gap:4}},
+        watchlist.map(w=>{
+          const key=w.pid||w.name;
+          const st=updateAllStatus[key]||{};
+          const statColor=st.stats==="ok"?"#4CAF50":st.stats==="error"?"#F44336":st.stats==="running"?"#4FC3F7":"#555";
+          const priceColor=st.prices==="ok"?"#4CAF50":st.prices==="error"||st.prices==="token_error"?"#F44336":st.prices==="running"?"#4FC3F7":st.prices==="skipped"?"#333":"#555";
+          const statIcon=st.stats==="ok"?"✓":st.stats==="error"?"✗":st.stats==="running"?"↻":"·";
+          const priceIcon=st.prices==="ok"?"✓":st.prices==="error"||st.prices==="token_error"?"✗":st.prices==="running"?"↻":st.prices==="skipped"?"—":"·";
+          return e("div",{key,style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 8px",background:"#141414",borderRadius:6}},
+            e("span",{style:{fontSize:11,color:"#ccc",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,marginRight:8}},w.name),
+            e("div",{style:{display:"flex",gap:10,flexShrink:0}},
+              e("div",{style:{display:"flex",gap:4,alignItems:"center"}},
+                e("span",{style:{fontSize:9,color:"#555",fontFamily:"monospace"}},"STATS"),
+                e("span",{style:{fontSize:11,color:statColor,fontFamily:"monospace",fontWeight:700}},statIcon)
+              ),
+              e("div",{style:{display:"flex",gap:4,alignItems:"center"}},
+                e("span",{style:{fontSize:9,color:"#555",fontFamily:"monospace"}},"PRICES"),
+                e("span",{style:{fontSize:11,color:priceColor,fontFamily:"monospace",fontWeight:700}},priceIcon)
+              )
+            )
+          );
+        })
+      ),
+      !updateAllRunning&&e("p",{style:{fontSize:9,color:"#444",fontFamily:"monospace",margin:"10px 0 0",textAlign:"center"}},
+        `Completed ${new Date().toLocaleTimeString()}`
+      )
+    )
   );
 }
 
