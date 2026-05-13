@@ -246,8 +246,20 @@ function StatBox({label,value,color="#ddd"}){
 }
 
 // ── WATCHLIST TAB ─────────────────────────────────────────────────────────────
-function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer,onJump}){
+function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer,onJump,autoScrollPid}){
   const [adding,setAdding]=useState(false);
+  const [highlightPid,setHighlightPid]=useState(null);
+  const cardRefs=useRef({});
+
+  // Scroll to and briefly highlight the jumped-to player
+  useEffect(()=>{
+    if(!autoScrollPid) return;
+    setHighlightPid(autoScrollPid);
+    const el=cardRefs.current[autoScrollPid];
+    if(el) el.scrollIntoView({behavior:"smooth",block:"center"});
+    const t=setTimeout(()=>setHighlightPid(null),2000);
+    return()=>clearTimeout(t);
+  },[autoScrollPid]);
   const [addSearch,setAddSearch]=useState("");
   const [refreshingPid,setRefreshingPid]=useState(null);
 
@@ -301,7 +313,7 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
     ),
 
     e("div",{style:{display:"flex",flexDirection:"column",gap:16}},
-      enriched.map(w=>e("div",{key:w.pid||w.name,style:{background:"#0d0d0d",border:"1px solid #1e1e1e",borderRadius:12,padding:20}},
+      enriched.map(w=>e("div",{key:w.pid||w.name,ref:el=>{if(el)cardRefs.current[w.pid]=el;},style:{background:"#0d0d0d",border:`1px solid ${highlightPid===w.pid?"#c62828":"#1e1e1e"}`,borderRadius:12,padding:20,transition:"border-color 0.3s"}},
         // Header
         e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10,marginBottom:12}},
           e("div",{style:{flex:1}},
@@ -617,12 +629,18 @@ function StatcastTab({statcast,bios,onImportStatcast,autoFilter,onJump}){
 }
 
 // ── FANGRAPHS TAB ─────────────────────────────────────────────────────────────
-function FangraphsTab({fg,onImport,onJump}){
+function FangraphsTab({fg,onImport,onJump,autoFilter}){
   const [search,setSearch]=useState("");
   const [filterOrg,setFilterOrg]=useState("");
   const [filterPos,setFilterPos]=useState("");
   const [sortBy,setSortBy]=useState("rk");
   const orgs=useMemo(()=>[...new Set(fg.map(p=>p.org))].filter(Boolean).sort(),[fg]);
+
+  // Auto-filter when jumped from another tab
+  useEffect(()=>{
+    if(!autoFilter) return;
+    setSearch(autoFilter);
+  },[autoFilter]);
   const positions=useMemo(()=>[...new Set(fg.map(p=>p.pos))].filter(Boolean).sort(),[fg]);
   const filtered=useMemo(()=>{
     let r=[...fg];
@@ -786,89 +804,184 @@ function CardGraderTab({initialPlayer}){
 }
 
 
-// ── 130point API ─────────────────────────────────────────────────────────────
-const PT_API = "https://back.130point.com/cards/";
 
-function buildQuery(playerName){ return "1st Bowman " + playerName; }
+// ── eBay API ──────────────────────────────────────────────────────────────────
+// App token cache
+let _ebayToken = null;
+let _ebayTokenExp = 0;
 
-async function fetch130point(query, token){
-  const body = new URLSearchParams({
-    query, sort:"date", mp:"eBay", tab_id:"1",
-    tz:"America/Chicago", width:"400", height:"800", tk:token
-  });
-  const res = await fetch(PT_API, {
+async function getEbayAppToken(clientId, clientSecret){
+  const now = Date.now();
+  if(_ebayToken && now < _ebayTokenExp - 60000) return _ebayToken;
+  const creds = btoa(`${clientId}:${clientSecret}`);
+  const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
     method:"POST",
     headers:{
       "Content-Type":"application/x-www-form-urlencoded",
-      "Referer":"https://130point.com/sales/",
-      "Origin":"https://130point.com"
+      "Authorization":`Basic ${creds}`
     },
-    body: body.toString()
+    body:"grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope"
   });
-  if(!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
+  if(!res.ok){
+    const err = await res.json().catch(()=>({error:"unknown"}));
+    if(res.status===401) throw Object.assign(new Error("invalid_credentials"), {ebayError:"invalid_credentials"});
+    if(res.status===400) throw Object.assign(new Error("bad_request"), {ebayError:"bad_request"});
+    throw Object.assign(new Error(err.error||`HTTP ${res.status}`), {ebayError:"auth_failed"});
+  }
+  const data = await res.json();
+  _ebayToken = data.access_token;
+  _ebayTokenExp = now + (data.expires_in||7200)*1000;
+  return _ebayToken;
 }
 
-function detect130PointTokenError(html){
-  const low = (html||"").toLowerCase();
-  if(!html || html.trim().length < 50) return "empty_response";
-  if(low.includes("invalid") && low.includes("token")) return "invalid_token";
-  if(low.includes("unauthorized") || low.includes("403")) return "unauthorized";
-  if(low.includes("expired")) return "expired_token";
-  // No data-price found at all in a reasonable-length response
-  if(html.length > 200 && !html.includes("data-price=")) return "no_data";
-  return null;
+async function searchEbaySold(query, token, pageNum=1){
+  const params = new URLSearchParams({
+    "OPERATION-NAME":"findCompletedItems",
+    "SERVICE-VERSION":"1.0.0",
+    "SECURITY-APPNAME": "placeholder", // replaced at call time
+    "RESPONSE-DATA-FORMAT":"JSON",
+    "REST-PAYLOAD":"",
+    "keywords":query,
+    "itemFilter(0).name":"SoldItemsOnly",
+    "itemFilter(0).value":"true",
+    "itemFilter(1).name":"ListingType",
+    "itemFilter(1).value":"FixedPrice",
+    "itemFilter(2).name":"ListingType(1)",
+    "itemFilter(2).value":"Auction",
+    "sortOrder":"EndTimeSoonest",
+    "paginationInput.entriesPerPage":"100",
+    `paginationInput.pageNumber`:String(pageNum),
+    "outputSelector(0)":"SellerInfo",
+    "outputSelector(1)":"PictureURLLargeSize",
+  });
+  const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`, {
+    headers:{"X-EBAY-SOA-SECURITY-APPNAME": "placeholder"}
+  });
+  if(!res.ok) throw new Error(`eBay search HTTP ${res.status}`);
+  return res.json();
 }
 
-// ── Parsing ───────────────────────────────────────────────────────────────────
-function parseSales(html){
+async function fetchEbaySoldListings(playerName, clientId, clientSecret, onProgress){
+  onProgress(`Getting eBay auth token...`);
+  const appToken = await getEbayAppToken(clientId, clientSecret);
+
+  const query = `Bowman 1st ${playerName}`;
+  onProgress(`Searching eBay sold listings: "${query}"`);
+
+  // Use Browse API for sold items - more reliable with OAuth
+  const headers = {
+    "Authorization": `Bearer ${appToken}`,
+    "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    "Content-Type": "application/json"
+  };
+
+  const params = new URLSearchParams({
+    q: query,
+    filter: "buyingOptions:{FIXED_PRICE|AUCTION},conditions:{USED|UNGRADED},deliveryCountry:US",
+    sort: "endingSoonest",
+    limit: "200",
+  });
+
+  // Try Browse API v1 search/item_summary
+  const res = await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`, {headers});
+  if(!res.ok){
+    const body = await res.text();
+    throw Object.assign(new Error(`Browse API ${res.status}`), {ebayError:"search_failed", detail:body});
+  }
+  const data = await res.json();
+  const items = data.itemSummaries || [];
+  onProgress(`  Found ${items.length} listings`);
+  return items;
+}
+
+function parseEbayItems(items, playerName){
   const sales = [];
-  const re = /data-price="([\d.]+)"([^<]*(?:<(?!tr)[^<]*)*?)(<tr[\s\S]*?<\/tr>)?/gi;
-  // Simpler: scan all data-price occurrences
-  const priceRe = /data-price="([\d.,]+)"/g;
-  // Find each table row
-  const rowRe = /<tr[\s\S]*?<\/tr>/gi;
-  const rows = html.match(rowRe) || [];
-  for(const row of rows){
-    const pm = row.match(/data-price="([\d.,]+)"/);
-    if(!pm) continue;
-    const price = parseFloat(pm[1].replace(/,/g,""));
-    if(!price || price<=0 || price>100000) continue;
-    const title = extractTitle(row);
-    const soldDate = extractDate(row);
+  for(const item of items){
+    const title = item.title || "";
+    // Price
+    const priceObj = item.lastSoldPrice || item.price || {};
+    const price = parseFloat(priceObj.value || "0");
+    if(!price || price <= 0 || price > 50000) continue;
+    // Date - lastSoldDate or itemEndDate
+    let soldDate = null;
+    const dateStr = item.lastSoldDate || item.itemEndDate || "";
+    if(dateStr) soldDate = new Date(dateStr);
     sales.push({price, title, soldDate});
   }
   return sales;
 }
 
-function extractTitle(row){
-  // Try anchor text first
-  const aMatch = row.match(/<a[^>]*>([^<]+)<\/a>/i);
-  if(aMatch) return cleanHtml(aMatch[1]);
-  // Try data-name attr
-  const dn = row.match(/data-name="([^"]+)"/i);
-  if(dn) return cleanHtml(dn[1]);
-  // Fallback: strip tags
-  return cleanHtml(row).slice(0,160).trim();
+// ── Error diagnostics ─────────────────────────────────────────────────────────
+function detectEbayError(err){
+  const msg = (err.message||"").toLowerCase();
+  const code = err.ebayError || "";
+  if(code==="invalid_credentials" || msg.includes("invalid_credentials")) return "invalid_credentials";
+  if(code==="bad_request") return "bad_request";
+  if(code==="auth_failed" || msg.includes("401")) return "auth_failed";
+  if(code==="search_failed") return "search_failed";
+  if(msg.includes("failed to fetch") || msg.includes("networkerror")) return "network_error";
+  return "unknown";
 }
 
-function extractDate(row){
-  const plain = cleanHtml(row);
-  // "Wed 15 Apr 2026 16:35:25"
-  const m1 = plain.match(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})/i);
-  if(m1){
-    const months={jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
-    const mo = months[m1[2].toLowerCase()];
-    if(mo!=null) return new Date(parseInt(m1[3]), mo, parseInt(m1[1]));
+// ── Main pull (replaces pullCardPrices) ───────────────────────────────────────
+async function pullCardPrices(playerName, credentials, onProgress){
+  // credentials = {clientId, clientSecret}
+  const {clientId, clientSecret} = credentials;
+  if(!clientId || !clientSecret) throw Object.assign(new Error("no_credentials"), {ebayError:"no_credentials"});
+
+  let items;
+  try{
+    items = await fetchEbaySoldListings(playerName, clientId, clientSecret, onProgress);
+  } catch(err){
+    const code = detectEbayError(err);
+    throw Object.assign(err, {tokenError: code});
   }
-  // mm/dd/yyyy
-  const m2 = plain.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
-  if(m2) return new Date(parseInt(m2[3]<100?m2[3]+2000:m2[3]), parseInt(m2[1])-1, parseInt(m2[2]));
-  return null;
-}
 
-function cleanHtml(s){
-  return (s||"").replace(/<[^>]*>/g," ").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&nbsp;/g," ").replace(/\s+/g," ").trim();
+  const rawSales = parseEbayItems(items, playerName);
+  onProgress(`  Parsed ${rawSales.length} sales with prices`);
+
+  const now = new Date();
+  const day30 = new Date(now - 30*864e5);
+  const day90 = new Date(now - 90*864e5);
+
+  const groups = {};
+  const rawComps = [];
+  let inferredYear = null;
+
+  for(const sale of rawSales){
+    const {price, title, soldDate} = sale;
+    if(!isBowman1st(title)){ rawComps.push({...sale,kept:false,reason:"Not Bowman 1st"}); continue; }
+    const excl = isExcluded(title);
+    if(excl){ rawComps.push({...sale,kept:false,reason:`Excluded: ${excl}`}); continue; }
+
+    const auto   = isAuto(title) ? "Auto" : "Non-Auto";
+    const type   = cardType(title);
+    const parallel = detectParallel(title);
+    const grade  = gradeBucket(title);
+    const yr     = yearInTitle(title);
+    if(yr && (!inferredYear || yr < inferredYear)) inferredYear = yr;
+
+    const key = `${auto}|${type}|${parallel}`;
+    if(!groups[key]) groups[key] = {auto,type,parallel,all:[],p30:[],p90:[],psa10:[],psa9:[],raw:[]};
+    const g = groups[key];
+    g.all.push(price);
+    if(soldDate){ if(soldDate>=day30) g.p30.push(price); if(soldDate>=day90) g.p90.push(price); }
+    if(grade==="PSA10") g.psa10.push(price);
+    else if(grade==="PSA9") g.psa9.push(price);
+    else if(grade==="RAW") g.raw.push(price);
+
+    rawComps.push({price,title,soldDate,kept:true,auto,type,parallel,grade,yr});
+  }
+
+  const lineItems = Object.values(groups).map(g=>({
+    player:playerName, auto:g.auto, type:g.type, parallel:g.parallel,
+    inferredYear, pulledAt:now.toISOString(),
+    stats:calcStats(g.all), stats30:calcStats(g.p30), stats90:calcStats(g.p90),
+    psa10:calcStats(g.psa10), psa9:calcStats(g.psa9), raw:calcStats(g.raw),
+  })).filter(li=>li.stats&&li.stats.count>0);
+
+  onProgress(`  → ${lineItems.length} line items, ${rawComps.filter(r=>r.kept).length} comps kept`);
+  return {lineItems, rawComps};
 }
 
 // ── Classification ────────────────────────────────────────────────────────────
@@ -1012,66 +1125,119 @@ async function pullCardPrices(playerName, token, onProgress){
 }
 
 // ── SETTINGS MODAL ────────────────────────────────────────────────────────────
-function SettingsModal({token, setToken, onClose}){
-  const [draft, setDraft] = React.useState(token);
-  const [saved, setSaved] = React.useState(false);
+
+// ── eBay error messages ───────────────────────────────────────────────────────
+const EBAY_TOKEN_ERRORS = {
+  no_credentials:{
+    icon:"🔑", title:"No eBay Credentials",
+    msg:"Open Settings (⚙) and enter your eBay Client ID and Client Secret to pull card prices."
+  },
+  invalid_credentials:{
+    icon:"🔑", title:"Invalid Credentials",
+    msg:"Your eBay Client ID or Secret was rejected. Double-check them in Settings — copy directly from developer.ebay.com."
+  },
+  auth_failed:{
+    icon:"🔒", title:"eBay Auth Failed",
+    msg:"Couldn't authenticate with eBay. Check your Client ID and Secret in Settings."
+  },
+  bad_request:{
+    icon:"⚠️", title:"Bad Request",
+    msg:"eBay rejected the auth request. Make sure you're using Production keys, not Sandbox keys."
+  },
+  search_failed:{
+    icon:"🔍", title:"Search Failed",
+    msg:"eBay auth succeeded but the search failed. Your app may not have the correct API permissions — check developer.ebay.com."
+  },
+  network_error:{
+    icon:"📡", title:"Network Error",
+    msg:"Couldn't reach eBay's API. Check your internet connection and try again."
+  },
+  unknown:{
+    icon:"⚠️", title:"Unknown Error",
+    msg:"Something went wrong. Try again — if it persists check your credentials in Settings."
+  },
+};
+
+
+function SettingsModal({clientId, clientSecret, setClientId, setClientSecret, onClose}){
+  const [draftId,   setDraftId]   = React.useState(clientId);
+  const [draftSec,  setDraftSec]  = React.useState(clientSecret);
+  const [saved,     setSaved]     = React.useState(false);
+
   const save = () => {
-    const t = draft.trim();
-    setToken(t);
-    store.set("milb-130pt-token", t);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    setClientId(draftId.trim());
+    setClientSecret(draftSec.trim());
+    store.set("milb-ebay-client-id",     draftId.trim());
+    store.set("milb-ebay-client-secret", draftSec.trim());
+    setSaved(true); setTimeout(()=>setSaved(false), 2000);
   };
+
+  const Field = ({label, value, onChange, placeholder}) =>
+    e("div",{style:{marginBottom:14}},
+      e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#888",margin:"0 0 6px"}},label),
+      e("input",{value, onChange:ev=>onChange(ev.target.value), placeholder,
+        style:{width:"100%",background:"#141414",border:`1px solid ${value?"#4FC3F7":"#2a2a2a"}`,
+          borderRadius:6,padding:"9px 12px",color:"#fff",fontFamily:"monospace",fontSize:12,outline:"none"}})
+    );
+
   return e("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}},
-    e("div",{style:{background:"#0d0d0d",border:"1px solid #2a2a2a",borderRadius:12,padding:28,width:"100%",maxWidth:500}},
+    e("div",{style:{background:"#0d0d0d",border:"1px solid #2a2a2a",borderRadius:12,padding:28,width:"100%",maxWidth:520}},
       e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}},
         e("h2",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:24,letterSpacing:3,color:"#fff",margin:0}},"SETTINGS"),
         e("button",{onClick:onClose,style:{background:"none",border:"none",color:"#555",fontSize:22,cursor:"pointer",lineHeight:1}},"×")
       ),
 
-      // 130point token
+      // eBay credentials
       e("div",{style:{background:"#0a0a0a",border:"1px solid #1a1a1a",borderRadius:8,padding:16,marginBottom:16}},
-        e("p",{style:{fontFamily:"monospace",fontSize:10,letterSpacing:2,color:"#4FC3F7",margin:"0 0 8px"}},"130POINT API TOKEN"),
-        e("p",{style:{fontSize:11,color:"#555",margin:"0 0 12px",lineHeight:1.6}},
-          "Get a fresh token: go to ",
-          e("span",{style:{color:"#4FC3F7"}},"130point.com/sales"),
-          " → open browser DevTools (F12) → Network tab → search for any card → find the POST request to ",
-          e("span",{style:{color:"#4FC3F7"}},"back.130point.com/cards/"),
-          " → copy the ",
-          e("span",{style:{color:"#FFD700"}},"tk="),
-          " value from the request body."
+        e("p",{style:{fontFamily:"monospace",fontSize:10,letterSpacing:2,color:"#4FC3F7",margin:"0 0 4px"}},"EBAY DEVELOPER CREDENTIALS"),
+        e("p",{style:{fontSize:11,color:"#555",margin:"0 0 14px",lineHeight:1.6}},
+          "From ",e("span",{style:{color:"#4FC3F7"}},"developer.ebay.com"),
+          " → My Account → Application Access → Production Keys"
         ),
-        e("div",{style:{display:"flex",gap:8}},
-          e("input",{
-            value:draft,
-            onChange:ev=>setDraft(ev.target.value),
-            placeholder:"Paste token here...",
-            style:{flex:1,background:"#141414",border:`1px solid ${draft?"#4FC3F7":"#2a2a2a"}`,borderRadius:6,padding:"9px 12px",color:"#fff",fontFamily:"monospace",fontSize:12,outline:"none"}
-          }),
-          e("button",{onClick:save,style:{padding:"9px 16px",background:saved?"#1a3a1a":"#4FC3F7",border:"none",borderRadius:6,color:saved?"#4CAF50":"#000",fontFamily:"monospace",fontSize:11,letterSpacing:1,cursor:"pointer",transition:"all 0.2s",fontWeight:700}},
-            saved ? "✓ SAVED" : "SAVE"
-          )
+        e(Field,{label:"CLIENT ID (App ID)",    value:draftId,  onChange:setDraftId,  placeholder:"e.g. YourName-CardApp-PRD-abc123..."}),
+        e(Field,{label:"CLIENT SECRET",          value:draftSec, onChange:setDraftSec, placeholder:"PRD-abc123..."}),
+        e("button",{onClick:save,style:{width:"100%",padding:"10px",background:saved?"#1a3a1a":"#4FC3F7",border:"none",borderRadius:6,color:saved?"#4CAF50":"#000",fontFamily:"monospace",fontSize:11,letterSpacing:1,cursor:"pointer",fontWeight:700,transition:"all 0.2s"}},
+          saved?"✓ SAVED":"SAVE CREDENTIALS"
         ),
-        draft && e("p",{style:{fontSize:10,color:"#444",fontFamily:"monospace",margin:"8px 0 0"}},
-          `Current: ${draft.slice(0,8)}...${draft.slice(-4)} (${draft.length} chars)`
+        (draftId||draftSec) && e("div",{style:{marginTop:10,display:"flex",gap:12}},
+          draftId  && e("p",{style:{fontSize:9,color:"#444",fontFamily:"monospace",margin:0}},`ID: ${draftId.slice(0,12)}...`),
+          draftSec && e("p",{style:{fontSize:9,color:"#444",fontFamily:"monospace",margin:0}},`Secret: ${draftSec.slice(0,8)}...`)
         )
       ),
 
-      // How to get token
-      e("div",{style:{background:"#0a0a00",border:"1px solid #2a2a00",borderRadius:8,padding:14}},
-        e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#FFD700",margin:"0 0 8px"}},"⚠ TOKEN EXPIRES PERIODICALLY"),
-        e("p",{style:{fontSize:11,color:"#665500",lineHeight:1.6,margin:0}},
-          "If card price pulls stop working, the token has expired. Re-fetch it from 130point.com using the steps above and save it here. The app will remember it across sessions."
+      // How-to box
+      e("div",{style:{background:"#0a0800",border:"1px solid #2a2000",borderRadius:8,padding:14,marginBottom:16}},
+        e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#FFD700",margin:"0 0 8px"}},"HOW TO GET YOUR KEYS"),
+        [
+          "Go to developer.ebay.com and sign in with your eBay account",
+          "Click 'Get Started' or navigate to My Account → Application Access",
+          "Create a new application — name it anything (e.g. Card Tracker)",
+          "Select Production (not Sandbox)",
+          "Copy the App ID (Client ID) and Client Secret from the keys page",
+          "Paste both above and click Save — the app handles token refresh automatically",
+        ].map((tip,i)=>e("div",{key:i,style:{display:"flex",gap:8,marginBottom:5}},
+          e("span",{style:{color:"#FFD700",fontSize:10,flexShrink:0,fontFamily:"monospace"}},`${i+1}.`),
+          e("p",{style:{fontSize:11,color:"#776600",margin:0,lineHeight:1.5}},tip)
+        ))
+      ),
+
+      e("div",{style:{background:"#080808",border:"1px solid #1a1a1a",borderRadius:8,padding:12,marginBottom:16}},
+        e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#4CAF50",margin:"0 0 4px"}},"✓ NO TOKEN MANAGEMENT NEEDED"),
+        e("p",{style:{fontSize:11,color:"#446644",margin:0,lineHeight:1.5}},
+          "Unlike 130point, eBay app tokens are fetched and refreshed automatically in the background using your Client ID and Secret. You only need to enter these once."
         )
       ),
 
-      e("button",{onClick:onClose,style:{marginTop:16,width:"100%",padding:"10px",background:"transparent",border:"1px solid #222",borderRadius:6,color:"#666",fontFamily:"monospace",fontSize:11,letterSpacing:2,cursor:"pointer"}},"CLOSE")
+      e("button",{onClick:onClose,style:{width:"100%",padding:"10px",background:"transparent",border:"1px solid #222",borderRadius:6,color:"#666",fontFamily:"monospace",fontSize:11,letterSpacing:2,cursor:"pointer"}},"CLOSE")
     )
   );
 }
 
+
+}
+
 // ── PRICES TAB ────────────────────────────────────────────────────────────────
-function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
+function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collection, setCollection, appPrices, setAppPrices, onJump, autoSelectPid}){
   const [prices, setPrices] = React.useState({});      // pid -> {lineItems, pulledAt, rawComps}
   const [history, setHistory] = React.useState({});    // pid -> [{pulledAt, lineItems}]
   const [pulling, setPulling] = React.useState(null);  // pid currently pulling
@@ -1079,7 +1245,13 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
   const [selected, setSelected] = React.useState(null);
   const [viewRaw, setViewRaw] = React.useState(false);
   const [activePlayer, setActivePlayer] = React.useState(watchlist[0]?.pid || null);
+
+  // Auto-select player when jumped from another tab
+  useEffect(()=>{
+    if(autoSelectPid) setActivePlayer(autoSelectPid);
+  },[autoSelectPid]);
   const [tokenError, setTokenError] = React.useState(null);
+  const [addPanel, setAddPanel] = React.useState(null); // {pid, li} - which row is open
 
   // Load persisted prices on mount
   React.useEffect(()=>{
@@ -1093,6 +1265,18 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
     }
     load();
   },[]);
+
+  // Ownership helpers
+  const ownedForLi = (pid,li) => {
+    const key = collKey(pid, li.auto, li.type, li.parallel);
+    const lots = collection[key]||[];
+    return lots.reduce((s,l)=>s+(l.qty||1),0);
+  };
+  const handleAddToCollection = (pid, li, lot) => {
+    const key = collKey(pid, li.auto, li.type, li.parallel);
+    setCollection(prev=>({...prev,[key]:[...(prev[key]||[]),lot]}));
+    setAddPanel(null);
+  };
 
   // Listen for price updates from Update All
   React.useEffect(()=>{
@@ -1117,18 +1301,19 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
   const persist = async (newPrices, newHistory) => {
     await store.set("milb-prices", JSON.stringify(newPrices));
     await store.set("milb-price-history", JSON.stringify(newHistory));
+    if(setAppPrices) setAppPrices(newPrices); // sync up to App for Collection tab
   };
 
   const pullPlayer = async (pid, name) => {
-    if(!token){
-      setTokenError("no_token");
+    if(!clientId||!clientSecret){
+      setTokenError("no_credentials");
       return;
     }
     setPulling(pid);
     setTokenError(null);
     setPullLog([`Pulling prices for ${name}...`]);
     try{
-      const {lineItems, rawComps} = await pullCardPrices(name, token, msg => setPullLog(prev=>[...prev, msg]));
+      const {lineItems, rawComps} = await pullCardPrices(name, {clientId, clientSecret}, msg => setPullLog(prev=>[...prev, msg]));
       const pulledAt = new Date().toISOString();
       const entry = {lineItems, rawComps, pulledAt};
 
@@ -1169,13 +1354,8 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
   const activeHistory = activePlayer ? (history[activePlayer]||[]) : [];
 
   // Token error banner
-  const TOKEN_ERRORS = {
-    no_token: {icon:"🔑", title:"No Token Set", msg:"Open Settings (⚙) and paste your 130point token to pull card prices."},
-    invalid_token: {icon:"🔑", title:"Invalid Token", msg:"Your 130point token was rejected. It may have expired — open Settings and paste a fresh token from 130point.com."},
-    unauthorized: {icon:"🔒", title:"Unauthorized", msg:"Access denied. Your token has likely expired — open Settings and get a new one from 130point.com."},
-    expired_token: {icon:"⏱", title:"Token Expired", msg:"Your 130point token has expired. Open Settings and paste a fresh token from 130point.com."},
-    empty_response: {icon:"📭", title:"Empty Response", msg:"130point returned no data. Your token may be stale, or the service may be temporarily down. Try again shortly."},
-    no_data: {icon:"🔍", title:"No Sales Found", msg:"130point returned a response but no sale data was found. Your token may be stale — check Settings."},
+  const TOKEN_ERRORS = EBAY_TOKEN_ERRORS;
+
   };
 
   return e("div",{style:{display:"flex",height:"calc(100vh - 57px)"}},
@@ -1258,7 +1438,7 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
             e("div",{style:{overflowX:"auto"}},
               e("table",{style:{width:"100%",fontSize:11,minWidth:700}},
                 e("thead",null,e("tr",{style:{background:"#0a0a0a"}},
-                  ["TYPE","PARALLEL","GRADE SPLIT","COUNT","MEDIAN","MEAN","P25","P75","30D MED","90D MED"].map(h=>
+                  ["TYPE","PARALLEL","GRADE SPLIT","COUNT","MEDIAN","MEAN","P25","P75","30D MED","90D MED","OWNED"].map(h=>
                     e("th",{key:h,style:{padding:"6px 10px",color:"#555",fontSize:9,letterSpacing:1,textAlign:"right",borderBottom:"1px solid #1a1a1a",whiteSpace:"nowrap",textAlign:h==="TYPE"||h==="PARALLEL"||h==="GRADE SPLIT"?"left":"right"}},h)
                   )
                 )),
@@ -1289,12 +1469,37 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
                         e("td",{style:{padding:"6px 10px",color:"#555",borderBottom:"1px solid #111",textAlign:"right"}},`$${li.stats.p25}`),
                         e("td",{style:{padding:"6px 10px",color:"#555",borderBottom:"1px solid #111",textAlign:"right"}},`$${li.stats.p75}`),
                         e("td",{style:{padding:"6px 10px",color:li.stats30?.count?"#4FC3F7":"#333",borderBottom:"1px solid #111",textAlign:"right"}},li.stats30?.count?`$${li.stats30.median}`:"—"),
-                        e("td",{style:{padding:"6px 10px",color:li.stats90?.count?"#9C27B0":"#333",borderBottom:"1px solid #111",textAlign:"right"}},li.stats90?.count?`$${li.stats90.median}`:"—")
+                        e("td",{style:{padding:"6px 10px",color:li.stats90?.count?"#9C27B0":"#333",borderBottom:"1px solid #111",textAlign:"right"}},li.stats90?.count?`$${li.stats90.median}`:"—"),
+                        e("td",{style:{padding:"6px 10px",borderBottom:"1px solid #111",textAlign:"right",whiteSpace:"nowrap"}},
+                          ownedForLi(activePlayer,li)>0
+                            ? e("div",{style:{display:"flex",alignItems:"center",gap:6}},
+                                e("span",{style:{fontSize:9,padding:"2px 6px",borderRadius:3,background:"#0a1a0a",color:"#4CAF50",border:"1px solid #1a3a1a",cursor:"pointer"},
+                                  onClick:()=>setAddPanel(addPanel?.li===li?null:{pid:activePlayer,li})},"📦 "+ownedForLi(activePlayer,li)),
+                                e("button",{onClick:()=>setAddPanel(addPanel?.li===li?null:{pid:activePlayer,li}),style:{fontSize:9,padding:"2px 6px",background:"#141414",border:"1px solid #222",borderRadius:3,color:"#555",cursor:"pointer"}},"+")
+                              )
+                            : e("button",{
+                                onClick:()=>setAddPanel(addPanel?.li===li?null:{pid:activePlayer,li}),
+                                style:{fontSize:9,padding:"3px 8px",background:"#0a1a0a",border:"1px solid #1a3a1a",borderRadius:3,color:"#4CAF50",cursor:"pointer",letterSpacing:1}
+                              },"+ ADD")
+                        )
                       );
                     })
                 )
               )
             )
+          ),
+
+          // Add to collection inline panel
+          addPanel && e("div",{style:{background:"#0a1a0a",border:"1px solid #1a3a1a",borderRadius:10,padding:16,marginBottom:8}},
+            e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#4CAF50",margin:"0 0 12px"}},
+              `ADD TO COLLECTION — ${addPanel.li.auto} ${addPanel.li.type} · ${addPanel.li.parallel}`
+            ),
+            e(AddToCollectionPanel,{
+              li:addPanel.li,
+              pid:addPanel.pid,
+              onSave:lot=>handleAddToCollection(addPanel.pid,addPanel.li,lot),
+              onCancel:()=>setAddPanel(null)
+            })
           ),
 
           // Price history
@@ -1374,17 +1579,18 @@ function PricesTab({watchlist, bios, token, tokenHealth, onJump}){
 
 // ── Player Jump Menu ─────────────────────────────────────────────────────────
 // TAB INDICES: 0=Watchlist 1=Prospects 2=Statcast 3=FanGraphs 4=Prices 5=CardGrader
-const TAB_IDX = {WATCHLIST:0,PROSPECTS:1,STATCAST:2,FANGRAPHS:3,PRICES:4,CARD_GRADER:5};
+const TAB_IDX = {WATCHLIST:0,MY_COLLECTION:1,PROSPECTS:2,STATCAST:3,FANGRAPHS:4,PRICES:5,CARD_GRADER:6};
 
 function JumpMenu({player, currentTab, onJump, onClose, watchlist}){
   const isWatched = watchlist && player?.pid && watchlist.find(w=>w.pid===player.pid);
   const DESTINATIONS = [
-    {tab:TAB_IDX.WATCHLIST,  label:"Watchlist",   icon:"📋", desc:"View card & stats",    show: !!isWatched},
-    {tab:TAB_IDX.PROSPECTS,  label:"Prospects",   icon:"🔍", desc:"Full bio & history",   show: !!player?.pid || !!player?.id},
-    {tab:TAB_IDX.STATCAST,   label:"Statcast",    icon:"⚡", desc:"Power metrics",        show: !!player?.pid || !!player?.id},
-    {tab:TAB_IDX.FANGRAPHS,  label:"FanGraphs",   icon:"📊", desc:"Scouting grades",      show: !!player?.name || !!player?.n},
-    {tab:TAB_IDX.PRICES,     label:"Prices",      icon:"💰", desc:"Card sales & history", show: !!isWatched},
-    {tab:TAB_IDX.CARD_GRADER,label:"Card Grader", icon:"⚾", desc:"Grade a card",         show: true},
+    {tab:TAB_IDX.WATCHLIST,     label:"Watchlist",     icon:"📋", desc:"View card & stats",    show: !!isWatched},
+    {tab:TAB_IDX.MY_COLLECTION, label:"My Collection", icon:"📦", desc:"Owned cards & P&L",    show: !!isWatched},
+    {tab:TAB_IDX.PROSPECTS,     label:"Prospects",     icon:"🔍", desc:"Full bio & history",   show: !!player?.pid || !!player?.id},
+    {tab:TAB_IDX.STATCAST,      label:"Statcast",      icon:"⚡", desc:"Power metrics",        show: !!player?.pid || !!player?.id},
+    {tab:TAB_IDX.FANGRAPHS,     label:"FanGraphs",     icon:"📊", desc:"Scouting grades",      show: !!player?.name || !!player?.n},
+    {tab:TAB_IDX.PRICES,        label:"Prices",        icon:"💰", desc:"Card sales & history", show: !!isWatched},
+    {tab:TAB_IDX.CARD_GRADER,   label:"Card Grader",   icon:"⚾", desc:"Grade a card",         show: true},
   ].filter(d => d.show && d.tab !== currentTab);
 
   // Click outside to close
@@ -1426,8 +1632,245 @@ function JumpMenu({player, currentTab, onJump, onClose, watchlist}){
   );
 }
 
+
+// ── MY COLLECTION ─────────────────────────────────────────────────────────────
+// collection = { [collKey]: [{qty, pricePaid, grade, notes, dateAdded}] }
+// collKey = "pid|auto|type|parallel"
+function collKey(pid, auto, type, parallel){ return `${pid}|${auto}|${type}|${parallel}`; }
+
+function CollectionTab({collection, setCollection, watchlist, bios, prices, onJump, autoFilterPid}){
+  const [sortBy, setSortBy] = useState("player");
+
+  // Auto-filter to player when jumped from another tab
+  useEffect(()=>{
+    if(autoFilterPid) setFilterPid(autoFilterPid);
+  },[autoFilterPid]);
+  const [filterPid, setFilterPid] = useState("");
+
+  // Build flat list of all owned entries
+  const allEntries = useMemo(()=>{
+    const rows = [];
+    for(const [key, lots] of Object.entries(collection)){
+      if(!lots||!lots.length) continue;
+      const [pid,auto,type,parallel] = key.split("|");
+      const bio = bios.find(b=>b.id===pid)||null;
+      const playerName = bio?.n || watchlist.find(w=>w.pid===pid)?.name || pid;
+      const playerPrices = prices[pid];
+
+      // Find matching line item for current market value
+      let marketMedian = null;
+      if(playerPrices?.lineItems){
+        const match = playerPrices.lineItems.find(li=>li.auto===auto&&li.type===type&&li.parallel===parallel);
+        if(match) marketMedian = match.stats?.median || null;
+      }
+
+      const totalQty = lots.reduce((s,l)=>s+(l.qty||1),0);
+      const totalCost = lots.reduce((s,l)=>s+((l.qty||1)*(l.pricePaid||0)),0);
+      const avgCost = totalQty ? totalCost/totalQty : 0;
+      const currentVal = marketMedian ? marketMedian*totalQty : null;
+      const gainLoss = currentVal != null ? currentVal - totalCost : null;
+      const gainLossPct = totalCost && gainLoss != null ? (gainLoss/totalCost)*100 : null;
+
+      rows.push({key,pid,auto,type,parallel,bio,playerName,lots,totalQty,totalCost,avgCost,currentVal,gainLoss,gainLossPct,marketMedian,playerPrices});
+    }
+
+    // Sort
+    if(sortBy==="player") rows.sort((a,b)=>a.playerName.localeCompare(b.playerName));
+    else if(sortBy==="value") rows.sort((a,b)=>(b.currentVal||0)-(a.currentVal||0));
+    else if(sortBy==="gain") rows.sort((a,b)=>(b.gainLoss||0)-(a.gainLoss||0));
+    else if(sortBy==="cost") rows.sort((a,b)=>b.totalCost-a.totalCost);
+    else if(sortBy==="qty") rows.sort((a,b)=>b.totalQty-a.totalQty);
+
+    return filterPid ? rows.filter(r=>r.pid===filterPid) : rows;
+  },[collection, bios, watchlist, prices, sortBy, filterPid]);
+
+  // Summary stats
+  const summary = useMemo(()=>{
+    const totalCards = allEntries.reduce((s,r)=>s+r.totalQty,0);
+    const totalCost  = allEntries.reduce((s,r)=>s+r.totalCost,0);
+    const totalVal   = allEntries.filter(r=>r.currentVal!=null).reduce((s,r)=>s+(r.currentVal||0),0);
+    const totalGL    = allEntries.filter(r=>r.gainLoss!=null).reduce((s,r)=>s+(r.gainLoss||0),0);
+    const valuedCount= allEntries.filter(r=>r.currentVal!=null).length;
+    return {totalCards,totalCost,totalVal,totalGL,valuedCount};
+  },[allEntries]);
+
+  const players = useMemo(()=>[...new Set(allEntries.map(r=>({pid:r.pid,name:r.playerName})).map(JSON.stringify))].map(JSON.parse),[allEntries]);
+
+  const removeLot = (key, lotIdx) => {
+    setCollection(prev=>{
+      const next={...prev};
+      const lots=[...(next[key]||[])];
+      lots.splice(lotIdx,1);
+      if(lots.length) next[key]=lots; else delete next[key];
+      return next;
+    });
+  };
+
+  const glColor = gl => gl==null?"#555":gl>0?"#4CAF50":gl<0?"#F44336":"#888";
+
+  return e("div",{style:{padding:20}},
+    // Header
+    e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}},
+      e("div",null,
+        e("h2",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:28,letterSpacing:3,color:"#fff",margin:"0 0 4px"}},"MY COLLECTION"),
+        e("p",{style:{color:"#555",fontSize:11,fontFamily:"monospace",margin:0}},"Add cards from the Prices tab · cost basis & gain/loss tracked")
+      ),
+      e("div",{style:{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}},
+        e("select",{value:filterPid,onChange:ev=>setFilterPid(ev.target.value),style:{background:"#111",border:"1px solid #1e1e1e",borderRadius:5,padding:"6px 8px",color:filterPid?"#fff":"#555",fontSize:10,cursor:"pointer"}},
+          e("option",{value:""},"All Players"),
+          players.map(p=>e("option",{key:p.pid,value:p.pid},p.name))
+        ),
+        e("select",{value:sortBy,onChange:ev=>setSortBy(ev.target.value),style:{background:"#111",border:"1px solid #c62828",borderRadius:5,padding:"6px 8px",color:"#c62828",fontSize:10,cursor:"pointer"}},
+          e("option",{value:"player"},"Sort: Player"),
+          e("option",{value:"value"},"Sort: Value"),
+          e("option",{value:"gain"},"Sort: Gain/Loss"),
+          e("option",{value:"cost"},"Sort: Cost"),
+          e("option",{value:"qty"},"Sort: Qty")
+        )
+      )
+    ),
+
+    // Summary bar
+    allEntries.length>0 && e("div",{style:{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:10,marginBottom:20}},
+      [{l:"TOTAL CARDS",v:summary.totalCards,c:"#ddd"},
+       {l:"TOTAL COST",v:`$${summary.totalCost.toFixed(2)}`,c:"#aaa"},
+       {l:"CURRENT VALUE",v:summary.valuedCount?`$${summary.totalVal.toFixed(2)}`:"—",c:"#4FC3F7"},
+       {l:"GAIN / LOSS",v:summary.valuedCount?(summary.totalGL>=0?"+":"")+`$${summary.totalGL.toFixed(2)}`:"—",c:glColor(summary.totalGL)},
+      ].map(s=>e("div",{key:s.l,style:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:8,padding:"12px 14px"}},
+        e("div",{style:{fontSize:9,color:"#555",fontFamily:"monospace",letterSpacing:1,marginBottom:4}},s.l),
+        e("div",{style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:22,color:s.c,letterSpacing:1}},s.v)
+      ))
+    ),
+
+    // Empty state
+    allEntries.length===0 && e("div",{style:{textAlign:"center",padding:60,color:"#2a2a2a"}},
+      e("div",{style:{fontSize:48,marginBottom:12}},"📦"),
+      e("p",{style:{fontFamily:"monospace",fontSize:11,letterSpacing:2,lineHeight:2}},
+        "NO CARDS IN COLLECTION\nGO TO PRICES TAB → CLICK + ADD TO COLLECTION ON ANY ROW"
+      )
+    ),
+
+    // Collection table
+    allEntries.length>0 && e("div",{style:{display:"flex",flexDirection:"column",gap:12}},
+      allEntries.map(row=>e("div",{key:row.key,style:{background:"#0d0d0d",border:"1px solid #1e1e1e",borderRadius:10,padding:16}},
+        // Row header
+        e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10,marginBottom:row.lots.length>0?12:0}},
+          e("div",{style:{flex:1}},
+            e("div",{style:{display:"flex",alignItems:"center",gap:8,marginBottom:5,flexWrap:"wrap"}},
+              e("span",{
+                onClick:()=>onJump&&onJump({pid:row.pid,name:row.playerName,id:row.pid}),
+                style:{fontFamily:"'Bebas Neue',sans-serif",fontSize:18,letterSpacing:2,color:"#fff",cursor:"pointer"},
+                onMouseEnter:ev=>ev.currentTarget.style.color="#4FC3F7",
+                onMouseLeave:ev=>ev.currentTarget.style.color="#fff"
+              },row.playerName),
+              e("span",{style:{fontSize:9,padding:"2px 6px",borderRadius:3,background:row.auto==="Auto"?"#1a0a0a":"#0a0a1a",color:row.auto==="Auto"?"#c62828":"#4FC3F7",border:`1px solid ${row.auto==="Auto"?"#3a1010":"#101030"}`}},row.auto),
+              e("span",{style:{fontSize:9,padding:"2px 6px",borderRadius:3,background:"#141414",color:"#888",border:"1px solid #222"}},row.type),
+              e("span",{style:{fontSize:9,padding:"2px 6px",borderRadius:3,background:"#141414",color:"#aaa",border:"1px solid #222"}},row.parallel)
+            ),
+            row.bio && e("p",{style:{color:"#555",fontSize:10,fontFamily:"monospace",margin:0}},`${row.bio.org} · ${row.bio.lvl}`)
+          ),
+          // Value summary
+          e("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,auto)",gap:"4px 16px",textAlign:"right"}},
+            [{l:"QTY",v:row.totalQty,c:"#ddd"},
+             {l:"AVG COST",v:`$${row.avgCost.toFixed(2)}`,c:"#aaa"},
+             {l:"MKT VALUE",v:row.marketMedian?`$${row.marketMedian.toFixed(2)}`:"—",c:"#4FC3F7"},
+             {l:"GAIN/LOSS",v:row.gainLoss!=null?(row.gainLoss>=0?"+":"")+`$${row.gainLoss.toFixed(2)}`:"—",c:glColor(row.gainLoss)},
+            ].map(s=>e("div",{key:s.l},
+              e("div",{style:{fontSize:8,color:"#444",fontFamily:"monospace",letterSpacing:1}},s.l),
+              e("div",{style:{fontSize:13,fontFamily:"'Bebas Neue',sans-serif",color:s.c}},s.v)
+            ))
+          )
+        ),
+
+        // Lots table
+        row.lots.length>0 && e("div",{style:{borderTop:"1px solid #1a1a1a",paddingTop:10}},
+          e("table",{style:{width:"100%",fontSize:10}},
+            e("thead",null,e("tr",null,
+              ["QTY","GRADE","PRICE PAID","TOTAL","DATE","NOTES",""].map(h=>
+                e("th",{key:h,style:{padding:"3px 8px",color:"#444",fontSize:8,letterSpacing:1,textAlign:"left",borderBottom:"1px solid #141414"}},h)
+              )
+            )),
+            e("tbody",null,
+              row.lots.map((lot,li)=>e("tr",{key:li,style:{background:li%2===0?"transparent":"#0a0a0a"}},
+                e("td",{style:{padding:"5px 8px",color:"#ccc",borderBottom:"1px solid #111"}},lot.qty||1),
+                e("td",{style:{padding:"5px 8px",borderBottom:"1px solid #111"}},
+                  e("span",{style:{fontSize:9,padding:"1px 5px",borderRadius:3,
+                    background:lot.grade==="PSA10"?"#1a1500":lot.grade==="PSA9"?"#111":"#0a0a0a",
+                    color:lot.grade==="PSA10"?"#FFD700":lot.grade==="PSA9"?"#C0C0C0":"#888",
+                    border:`1px solid ${lot.grade==="PSA10"?"#3a3000":lot.grade==="PSA9"?"#333":"#1a1a1a"}`
+                  }},lot.grade||"RAW")
+                ),
+                e("td",{style:{padding:"5px 8px",color:"#aaa",borderBottom:"1px solid #111"}},lot.pricePaid?`$${Number(lot.pricePaid).toFixed(2)}`:"—"),
+                e("td",{style:{padding:"5px 8px",color:"#4CAF50",borderBottom:"1px solid #111"}},lot.pricePaid?`$${((lot.qty||1)*Number(lot.pricePaid)).toFixed(2)}`:"—"),
+                e("td",{style:{padding:"5px 8px",color:"#555",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},lot.dateAdded?new Date(lot.dateAdded).toLocaleDateString():"—"),
+                e("td",{style:{padding:"5px 8px",color:"#555",borderBottom:"1px solid #111",maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},lot.notes||"—"),
+                e("td",{style:{padding:"5px 8px",borderBottom:"1px solid #111",textAlign:"right"}},
+                  e("button",{onClick:()=>removeLot(row.key,li),style:{background:"none",border:"none",color:"#3a1a1a",fontSize:12,cursor:"pointer",padding:"0 2px"},onMouseEnter:ev=>ev.currentTarget.style.color="#F44336",onMouseLeave:ev=>ev.currentTarget.style.color="#3a1a1a"},"✕")
+                )
+              ))
+            )
+          )
+        )
+      ))
+    )
+  );
+}
+
+// ── ADD TO COLLECTION INLINE PANEL ────────────────────────────────────────────
+function AddToCollectionPanel({li, pid, onSave, onCancel}){
+  const [qty, setQty]           = useState(1);
+  const [pricePaid, setPricePaid] = useState(li.stats?.median||"");
+  const [grade, setGrade]       = useState("RAW");
+  const [notes, setNotes]       = useState("");
+
+  const save = () => {
+    onSave({
+      qty: parseInt(qty)||1,
+      pricePaid: parseFloat(pricePaid)||0,
+      grade,
+      notes,
+      dateAdded: new Date().toISOString()
+    });
+  };
+
+  const inp = (val,set,type="text",placeholder="") =>
+    e("input",{type,value:val,onChange:ev=>set(ev.target.value),placeholder,
+      style:{background:"#0a0a0a",border:"1px solid #2a2a2a",borderRadius:5,padding:"6px 8px",
+        color:"#fff",fontFamily:"monospace",fontSize:11,outline:"none",width:"100%"}});
+
+  return e("tr",{style:{background:"#0a1a0a"}},
+    e("td",{colSpan:10,style:{padding:"12px 10px",borderBottom:"1px solid #1a3a1a"}},
+      e("div",{style:{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap"}},
+        e("div",{style:{minWidth:60}},
+          e("div",{style:{fontSize:8,color:"#4CAF50",fontFamily:"monospace",letterSpacing:1,marginBottom:4}},"QTY"),
+          inp(qty,setQty,"number","1")
+        ),
+        e("div",{style:{minWidth:100}},
+          e("div",{style:{fontSize:8,color:"#4CAF50",fontFamily:"monospace",letterSpacing:1,marginBottom:4}},"PRICE PAID ($)"),
+          inp(pricePaid,setPricePaid,"number","0.00")
+        ),
+        e("div",{style:{minWidth:100}},
+          e("div",{style:{fontSize:8,color:"#4CAF50",fontFamily:"monospace",letterSpacing:1,marginBottom:4}},"GRADE"),
+          e("select",{value:grade,onChange:ev=>setGrade(ev.target.value),
+            style:{background:"#0a0a0a",border:"1px solid #2a2a2a",borderRadius:5,padding:"6px 8px",color:"#fff",fontFamily:"monospace",fontSize:11,width:"100%"}},
+            ["RAW","PSA 9","PSA 10","BGS 9.5","SGC 10","Other"].map(g=>e("option",{key:g,value:g},g))
+          )
+        ),
+        e("div",{style:{flex:1,minWidth:140}},
+          e("div",{style:{fontSize:8,color:"#4CAF50",fontFamily:"monospace",letterSpacing:1,marginBottom:4}},"NOTES"),
+          inp(notes,setNotes,"text","e.g. bought on eBay Sept 2024")
+        ),
+        e("div",{style:{display:"flex",gap:6}},
+          e("button",{onClick:save,style:{padding:"7px 14px",background:"#4CAF50",border:"none",borderRadius:5,color:"#000",fontFamily:"monospace",fontSize:11,fontWeight:700,cursor:"pointer",letterSpacing:1}},"SAVE"),
+          e("button",{onClick:onCancel,style:{padding:"7px 10px",background:"#141414",border:"1px solid #2a2a2a",borderRadius:5,color:"#555",fontFamily:"monospace",fontSize:11,cursor:"pointer"}},"✕")
+        )
+      )
+    )
+  );
+}
+
 // ── ROOT ──────────────────────────────────────────────────────────────────────
-const TABS=["WATCHLIST","PROSPECTS","STATCAST","FANGRAPHS","PRICES","CARD GRADER"];
+const TABS=["WATCHLIST","MY COLLECTION","PROSPECTS","STATCAST","FANGRAPHS","PRICES","CARD GRADER"];
 
 function App(){
   const [tab,setTab]=useState(0);
@@ -1441,13 +1884,20 @@ function App(){
   const [loadMsg,setLoadMsg]=useState("Decompressing data...");
   const [loadPct,setLoadPct]=useState(0);
   const [refreshing,setRefreshing]=useState(false);
-  const [token,setToken]=useState("");
+  const [clientId,setClientId]=useState("");
+  const [clientSecret,setClientSecret]=useState("");
   const [showSettings,setShowSettings]=useState(false);
   const [tokenHealth,setTokenHealth]=useState("unknown"); // "unknown"|"ok"|"error"|"stale"
   const [updateAllRunning,setUpdateAllRunning]=useState(false);
   const [jumpMenu,setJumpMenu]=useState(null); // {player, currentTab}
-  const [prospectFilter,setProspectFilter]=useState(null); // player to highlight/select in Prospects
-  const [statcastFilter,setStatcastFilter]=useState(null); // player name to filter in Statcast
+  const [collection,setCollection]=useState({});
+  const [prices,setPrices]=useState({}); // latest price data for Collection tab // collKey -> [{qty,pricePaid,grade,notes,dateAdded}]
+  const [prospectFilter,setProspectFilter]=useState(null);
+  const [statcastFilter,setStatcastFilter]=useState(null);
+  const [fgFilter,setFgFilter]=useState(null);
+  const [priceFilter,setPriceFilter]=useState(null);
+  const [watchlistFilter,setWatchlistFilter]=useState(null);
+  const [collectionFilter,setCollectionFilter]=useState(null);
   const [updateAllStatus,setUpdateAllStatus]=useState({}); // pid -> {stats,prices}
   const [showUpdatePanel,setShowUpdatePanel]=useState(false);
   const [refreshLog,setRefreshLog]=useState([]);
@@ -1497,7 +1947,9 @@ function App(){
         }
 
         // Load saved token
-        try{const st=await store.get("milb-130pt-token");if(st?.value)setToken(st.value);}catch{}
+        try{const sc2=await store.get("milb-collection");if(sc2?.value)setCollection(JSON.parse(sc2.value));
+        const sp2=await store.get("milb-prices");if(sp2?.value)setPrices(JSON.parse(sp2.value));
+        const si=await store.get("milb-ebay-client-id");const ss=await store.get("milb-ebay-client-secret");if(si?.value)setClientId(si.value);if(ss?.value)setClientSecret(ss.value);}catch{}
         setLoadPct(100);setLoadMsg("Ready!");
         setTimeout(()=>setReady(true),200);
       }catch(err){setLoadMsg("Error: "+err.message);}
@@ -1530,6 +1982,11 @@ function App(){
     if(!ready)return;
     store.set("milb-watchlist",JSON.stringify(watchlist));
   },[watchlist,ready]);
+
+  useEffect(()=>{
+    if(!ready)return;
+    store.set("milb-collection",JSON.stringify(collection));
+  },[collection,ready]);
 
   // ── Live refresh: all rosters ──────────────────────────────────────────────
   const handleLiveRefreshAll=async()=>{
@@ -1618,30 +2075,24 @@ function App(){
   };
 
   // ── Token health check ──────────────────────────────────────────────────
-  const checkTokenHealth = React.useCallback(async(tk) => {
-    if(!tk){ setTokenHealth("error"); return "error"; }
+  const checkTokenHealth = React.useCallback(async(cid, csec) => {
+    if(!cid || !csec){ setTokenHealth("error"); return "error"; }
     setTokenHealth("unknown");
     try{
-      // Test with a lightweight query - just check we get back valid data
-      const body = new URLSearchParams({
-        query:"Bowman Chrome", sort:"date", mp:"eBay", tab_id:"1",
-        tz:"America/Chicago", width:"400", height:"800", tk
-      });
-      const res = await fetch("https://back.130point.com/cards/", {
-        method:"POST",
-        headers:{"Content-Type":"application/x-www-form-urlencoded","Referer":"https://130point.com/sales/","Origin":"https://130point.com"},
-        body: body.toString()
-      });
-      if(!res.ok){ setTokenHealth("error"); return "error"; }
-      const html = await res.text();
-      const err = detect130PointTokenError(html);
-      if(err && err !== "no_data"){ setTokenHealth("stale"); return "stale"; }
+      await getEbayAppToken(cid, csec);
       setTokenHealth("ok"); return "ok";
-    }catch{ setTokenHealth("error"); return "error"; }
+    }catch(err){
+      const code = detectEbayError(err);
+      setTokenHealth(code==="network_error" ? "error" : "stale");
+      return "stale";
+    }
   }, []);
 
-  // Check token health whenever token changes
-  React.useEffect(()=>{ if(token) checkTokenHealth(token); else setTokenHealth("error"); },[token]);
+  // Check token health whenever credentials change
+  React.useEffect(()=>{
+    if(clientId && clientSecret) checkTokenHealth(clientId, clientSecret);
+    else setTokenHealth("error");
+  },[clientId, clientSecret]);
 
   // ── Update All ───────────────────────────────────────────────────────────
   const handleUpdateAll = async() => {
@@ -1665,11 +2116,11 @@ function App(){
       }
 
       // Price pull
-      if(token && tokenHealth==="ok"){
+      if(clientId && clientSecret && tokenHealth==="ok"){
         setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:"running"}}));
         try{
           // Re-use pullCardPrices directly and update prices state
-          const {lineItems, rawComps} = await pullCardPrices(w.name, token, ()=>{});
+          const {lineItems, rawComps} = await pullCardPrices(w.name, {clientId, clientSecret}, ()=>{});
           const pulledAt = new Date().toISOString();
           const entry = {lineItems, rawComps, pulledAt};
           // Update price state — dispatch custom event for PricesTab to pick up
@@ -1682,7 +2133,7 @@ function App(){
           setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:isToken?"token_error":"error"}}));
           if(isToken){ setTokenHealth("stale"); break; } // stop price pulls if token died
         }
-      } else if(!token){
+      } else if(!clientId||!clientSecret){
         setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:"skipped"}}));
       }
     }
@@ -1691,18 +2142,29 @@ function App(){
 
   // ── Cross-tab jump handler ───────────────────────────────────────────────
   const handleJump = React.useCallback((destTab, player) => {
+    // Normalise player identifier
+    const pid  = player?.pid || player?.id || null;
+    const name = player?.name || player?.n || player?.displayName || "";
+
     setTab(destTab);
+
     if(destTab === TAB_IDX.PROSPECTS){
-      // Pass player to auto-select in Prospects
-      setProspectFilter(player?.pid || player?.id || null);
+      setProspectFilter(pid);
     }
     if(destTab === TAB_IDX.STATCAST){
-      // Pass player name to filter Statcast
-      const dn = player?.name || player?.n || player?.displayName || "";
-      // Statcast names are "Last, First" format
-      const parts = dn.split(" ");
-      const scName = parts.length > 1 ? parts.slice(1).join(" ")+", "+parts[0] : dn;
-      setStatcastFilter(dn); // pass natural name, Statcast tab will handle matching
+      setStatcastFilter(name);
+    }
+    if(destTab === TAB_IDX.FANGRAPHS){
+      setFgFilter(name);
+    }
+    if(destTab === TAB_IDX.PRICES){
+      setPriceFilter(pid);
+    }
+    if(destTab === TAB_IDX.WATCHLIST){
+      setWatchlistFilter(pid);
+    }
+    if(destTab === TAB_IDX.MY_COLLECTION){
+      setCollectionFilter(pid);
     }
     if(destTab === TAB_IDX.CARD_GRADER){
       setGradeTarget(player);
@@ -1748,14 +2210,14 @@ function App(){
           refreshing&&e("span",{style:{color:"#4FC3F7",fontSize:9,animation:"pulse 1s infinite"}},"● LIVE PULL")
         ),
         // Token health indicator
-        token && e("div",{title:`130point token: ${tokenHealth}`,style:{display:"flex",alignItems:"center",gap:4,fontSize:9,cursor:"default"}},
+        (clientId&&clientSecret) && e("div",{title:`eBay API: ${tokenHealth}`,style:{display:"flex",alignItems:"center",gap:4,fontSize:9,cursor:"default"}},
           e("span",{style:{
             width:7,height:7,borderRadius:"50%",display:"inline-block",flexShrink:0,
             background:tokenHealth==="ok"?"#4CAF50":tokenHealth==="stale"?"#FF9800":tokenHealth==="error"?"#F44336":"#555",
             boxShadow:tokenHealth==="ok"?"0 0 4px #4CAF50":tokenHealth==="stale"?"0 0 4px #FF9800":"none"
           }}),
           e("span",{style:{color:tokenHealth==="ok"?"#4CAF50":tokenHealth==="stale"?"#FF9800":tokenHealth==="error"?"#F44336":"#555"}},
-            tokenHealth==="ok"?"TOKEN OK":tokenHealth==="stale"?"TOKEN STALE":tokenHealth==="error"?"TOKEN ERROR":"CHECKING..."
+            tokenHealth==="ok"?"EBAY OK":tokenHealth==="stale"?"EBAY ERROR":tokenHealth==="error"?"EBAY ERROR":"CHECKING..."
           )
         ),
         // Update All button
@@ -1774,13 +2236,14 @@ function App(){
       refreshLog.map((l,i)=>e("p",{key:i,style:{fontSize:10,color:"#888",margin:"2px 0",fontFamily:"monospace"}},l))
     ),
 
-    tab===0&&e(WatchlistTab,{watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer:handleRefreshPlayer,onJump:(p)=>setJumpMenu({player:p,currentTab:0})}),
-    tab===1&&e(ProspectsTab,{bios,hitting,onAddToWatchlist,onLiveRefreshAll:handleLiveRefreshAll,refreshing,autoSelectId:prospectFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:1})}),
-    tab===2&&e(StatcastTab,{statcast,bios,onImportStatcast:handleImportStatcast,autoFilter:statcastFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:2})}),
-    tab===3&&e(React.Fragment,null,e("input",{ref:fgRef,type:"file",accept:".csv",style:{display:"none"},onChange:handleFgImport}),e(FangraphsTab,{fg,onImport:()=>fgRef.current.click(),onJump:(p)=>setJumpMenu({player:p,currentTab:3})})),
-    tab===4&&e(PricesTab,{watchlist,bios,token,tokenHealth,onJump:(p)=>setJumpMenu({player:p,currentTab:4})}),
-    tab===5&&e(CardGraderTab,{initialPlayer:gradeTarget}),
-    showSettings&&e(SettingsModal,{token,setToken,onClose:()=>setShowSettings(false)}),
+    tab===0&&e(WatchlistTab,{watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer:handleRefreshPlayer,onJump:(p)=>setJumpMenu({player:p,currentTab:0}),autoScrollPid:watchlistFilter}),
+    tab===1&&e(CollectionTab,{collection,setCollection,watchlist,bios,prices,onJump:(p)=>setJumpMenu({player:p,currentTab:1}),autoFilterPid:collectionFilter}),
+    tab===2&&e(ProspectsTab,{bios,hitting,onAddToWatchlist,onLiveRefreshAll:handleLiveRefreshAll,refreshing,autoSelectId:prospectFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:2})}),
+    tab===3&&e(StatcastTab,{statcast,bios,onImportStatcast:handleImportStatcast,autoFilter:statcastFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:3})}),
+    tab===4&&e(React.Fragment,null,e("input",{ref:fgRef,type:"file",accept:".csv",style:{display:"none"},onChange:handleFgImport}),e(FangraphsTab,{fg,onImport:()=>fgRef.current.click(),onJump:(p)=>setJumpMenu({player:p,currentTab:4}),autoFilter:fgFilter})),
+    tab===5&&e(PricesTab,{watchlist,bios,clientId,clientSecret,tokenHealth,collection,setCollection,appPrices:prices,setAppPrices:setPrices,onJump:(p)=>setJumpMenu({player:p,currentTab:5}),autoSelectPid:priceFilter}),
+    tab===6&&e(CardGraderTab,{initialPlayer:gradeTarget}),
+    showSettings&&e(SettingsModal,{clientId,clientSecret,setClientId,setClientSecret,onClose:()=>setShowSettings(false)}),
     jumpMenu&&e(JumpMenu,{player:jumpMenu.player,currentTab:jumpMenu.currentTab,watchlist,onJump:handleJump,onClose:()=>setJumpMenu(null)}),
     showUpdatePanel&&e("div",{style:{position:"fixed",bottom:20,right:20,background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:10,padding:16,zIndex:200,width:320,boxShadow:"0 4px 24px rgba(0,0,0,0.6)"}},
       e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}},
