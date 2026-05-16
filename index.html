@@ -7,6 +7,22 @@
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script>
+function showError(title, detail) {
+  var d = document.createElement("div");
+  d.style.cssText = "position:fixed;inset:0;background:#0a0000;color:#ff6b6b;padding:30px;font-family:monospace;z-index:99999;overflow:auto;font-size:12px";
+  d.innerHTML = "<h2 style=\"color:#c62828;margin-bottom:12px\">" + title + "</h2><pre style=\"background:#141414;padding:12px;border-radius:6px;white-space:pre-wrap\">" + detail + "</pre>";
+  if (document.body) { document.body.appendChild(d); }
+  else { document.addEventListener("DOMContentLoaded", function(){ document.body.appendChild(d); }); }
+}
+window.addEventListener("error", function(e) {
+  showError("ERROR: " + (e.message||"unknown") + " (line " + (e.lineno||"?") + ")",
+    e.error ? e.error.stack : ((e.filename||"") + ":" + (e.lineno||"")));
+});
+window.addEventListener("unhandledrejection", function(e) {
+  showError("UNHANDLED PROMISE", e.reason ? (e.reason.stack || String(e.reason)) : "unknown");
+});
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{background:#080808;color:#ccc;font-family:"IBM Plex Mono",monospace;}
@@ -178,8 +194,11 @@ function renderLogin() {
 }
 
 function launchApp() {
-  // Boot the main IIFE app
-  initMiLBApp();
+  try {
+    initMiLBApp();
+  } catch(err) {
+    showError("APP LAUNCH ERROR: " + err.name, err.stack || err.message);
+  }
 }
 
 // On load: check session or show login
@@ -1003,7 +1022,7 @@ async function searchEbaySold(query, token, pageNum=1){
     "itemFilter(2).value":"Auction",
     "sortOrder":"EndTimeSoonest",
     "paginationInput.entriesPerPage":"100",
-    `paginationInput.pageNumber`:String(pageNum),
+    "paginationInput.pageNumber":String(pageNum),
     "outputSelector(0)":"SellerInfo",
     "outputSelector(1)":"PictureURLLargeSize",
   });
@@ -1506,8 +1525,6 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
   // Token error banner
   const TOKEN_ERRORS = EBAY_TOKEN_ERRORS;
 
-  };
-
   return e("div",{style:{display:"flex",height:"calc(100vh - 57px)"}},
 
     // Left: player list
@@ -1725,7 +1742,6 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
         )
   );
 }
-
 
 // ── Player Jump Menu ─────────────────────────────────────────────────────────
 // TAB INDICES: 0=Watchlist 1=Prospects 2=Statcast 3=FanGraphs 4=Prices 5=CardGrader
@@ -2102,7 +2118,11 @@ function App(){
         const si=await store.get("milb-ebay-client-id");const ss=await store.get("milb-ebay-client-secret");if(si?.value)setClientId(si.value);if(ss?.value)setClientSecret(ss.value);}catch{}
         setLoadPct(100);setLoadMsg("Ready!");
         setTimeout(()=>setReady(true),200);
-      }catch(err){setLoadMsg("Error: "+err.message);}
+      }catch(err){
+        try{ setLoadMsg("Error: "+err.message); }catch(e2){}
+        // Also write directly to DOM as fallback
+        showError("LOAD ERROR: " + err.message, err.stack || "");
+      }
     }
     load();
   },[]);
@@ -2435,7 +2455,11 @@ function App(){
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+try {
+  ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+} catch(renderErr) {
+  showError("REACT RENDER ERROR: " + renderErr.message, renderErr.stack || "");
+}
 
 
 })();
