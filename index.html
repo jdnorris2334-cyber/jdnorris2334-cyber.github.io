@@ -13,7 +13,6 @@ function showError(title, detail) {
   d.style.cssText = "position:fixed;inset:0;background:#0a0000;color:#ff6b6b;padding:30px;font-family:monospace;z-index:99999;overflow:auto;font-size:12px";
   d.innerHTML = "<h2 style=\"color:#c62828;margin-bottom:12px\">" + title + "</h2><pre style=\"background:#141414;padding:12px;border-radius:6px;white-space:pre-wrap\">" + detail + "</pre>";
   if (document.body) { document.body.appendChild(d); }
-  else { document.addEventListener("DOMContentLoaded", function(){ document.body.appendChild(d); }); }
 }
 window.addEventListener("error", function(e) {
   showError("ERROR: " + (e.message||"unknown") + " (line " + (e.lineno||"?") + ")",
@@ -201,12 +200,13 @@ function launchApp() {
   }
 }
 
-// On load: check session or show login
-if (checkAuth()) {
-  // Already authenticated this session - go straight to app
-  document.addEventListener("DOMContentLoaded", () => initMiLBApp());
-} else {
-  document.addEventListener("DOMContentLoaded", () => renderLogin());
+// Boot - called after all scripts have loaded
+function boot() {
+  if (checkAuth()) {
+    initMiLBApp();
+  } else {
+    renderLogin();
+  }
 }
 
 </script>
@@ -982,85 +982,46 @@ function CardGraderTab({initialPlayer}){
 let _ebayToken = null;
 let _ebayTokenExp = 0;
 
+// Netlify proxy - avoids CORS restrictions on eBay API
+const PROXY_URL = "/.netlify/functions/ebay-proxy";
+
 async function getEbayAppToken(clientId, clientSecret){
   const now = Date.now();
   if(_ebayToken && now < _ebayTokenExp - 60000) return _ebayToken;
-  const creds = btoa(`${clientId}:${clientSecret}`);
-  const res = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+  const res = await fetch(PROXY_URL, {
     method:"POST",
-    headers:{
-      "Content-Type":"application/x-www-form-urlencoded",
-      "Authorization":`Basic ${creds}`
-    },
-    body:"grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope"
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"get_token", clientId, clientSecret})
   });
-  if(!res.ok){
-    const err = await res.json().catch(()=>({error:"unknown"}));
-    if(res.status===401) throw Object.assign(new Error("invalid_credentials"), {ebayError:"invalid_credentials"});
-    if(res.status===400) throw Object.assign(new Error("bad_request"), {ebayError:"bad_request"});
-    throw Object.assign(new Error(err.error||`HTTP ${res.status}`), {ebayError:"auth_failed"});
-  }
   const data = await res.json();
+  if(!res.ok){
+    const code = data.error||"auth_failed";
+    if(code==="invalid_credentials"||res.status===401)
+      throw Object.assign(new Error("invalid_credentials"),{ebayError:"invalid_credentials"});
+    if(res.status===400)
+      throw Object.assign(new Error("bad_request"),{ebayError:"bad_request"});
+    throw Object.assign(new Error(code),{ebayError:"auth_failed"});
+  }
   _ebayToken = data.access_token;
   _ebayTokenExp = now + (data.expires_in||7200)*1000;
   return _ebayToken;
 }
 
-async function searchEbaySold(query, token, pageNum=1){
-  const params = new URLSearchParams({
-    "OPERATION-NAME":"findCompletedItems",
-    "SERVICE-VERSION":"1.0.0",
-    "SECURITY-APPNAME": "placeholder", // replaced at call time
-    "RESPONSE-DATA-FORMAT":"JSON",
-    "REST-PAYLOAD":"",
-    "keywords":query,
-    "itemFilter(0).name":"SoldItemsOnly",
-    "itemFilter(0).value":"true",
-    "itemFilter(1).name":"ListingType",
-    "itemFilter(1).value":"FixedPrice",
-    "itemFilter(2).name":"ListingType(1)",
-    "itemFilter(2).value":"Auction",
-    "sortOrder":"EndTimeSoonest",
-    "paginationInput.entriesPerPage":"100",
-    "paginationInput.pageNumber":String(pageNum),
-    "outputSelector(0)":"SellerInfo",
-    "outputSelector(1)":"PictureURLLargeSize",
-  });
-  const res = await fetch(`https://svcs.ebay.com/services/search/FindingService/v1?${params}`, {
-    headers:{"X-EBAY-SOA-SECURITY-APPNAME": "placeholder"}
-  });
-  if(!res.ok) throw new Error(`eBay search HTTP ${res.status}`);
-  return res.json();
-}
 
 async function fetchEbaySoldListings(playerName, clientId, clientSecret, onProgress){
   onProgress(`Getting eBay auth token...`);
   const appToken = await getEbayAppToken(clientId, clientSecret);
-
   const query = `Bowman 1st ${playerName}`;
   onProgress(`Searching eBay sold listings: "${query}"`);
-
-  // Use Browse API for sold items - more reliable with OAuth
-  const headers = {
-    "Authorization": `Bearer ${appToken}`,
-    "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
-    "Content-Type": "application/json"
-  };
-
-  const params = new URLSearchParams({
-    q: query,
-    filter: "buyingOptions:{FIXED_PRICE|AUCTION},conditions:{USED|UNGRADED},deliveryCountry:US",
-    sort: "endingSoonest",
-    limit: "200",
+  const res = await fetch(PROXY_URL, {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"search", appToken, query})
   });
-
-  // Try Browse API v1 search/item_summary
-  const res = await fetch(`https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`, {headers});
-  if(!res.ok){
-    const body = await res.text();
-    throw Object.assign(new Error(`Browse API ${res.status}`), {ebayError:"search_failed", detail:body});
-  }
   const data = await res.json();
+  if(!res.ok){
+    throw Object.assign(new Error(data.error||"search_failed"),{ebayError:"search_failed"});
+  }
   const items = data.itemSummaries || [];
   onProgress(`  Found ${items.length} listings`);
   return items;
@@ -1224,77 +1185,6 @@ function calcStats(prices){
   };
 }
 
-// ── Main pull function ────────────────────────────────────────────────────────
-async function pullCardPrices(playerName, token, onProgress){
-  const query = buildQuery(playerName);
-  onProgress(`Querying: ${query}`);
-
-  const html = await fetch130point(query, token);
-
-  // Token / error detection
-  const tokenErr = detect130PointTokenError(html);
-  if(tokenErr) throw Object.assign(new Error(tokenErr), {tokenError:tokenErr});
-
-  const rawSales = parseSales(html);
-  onProgress(`  Found ${rawSales.length} raw sales`);
-
-  const now = new Date();
-  const day30 = new Date(now - 30*864e5);
-  const day90 = new Date(now - 90*864e5);
-
-  // Groups: key = "auto|type|parallel"
-  const groups = {};
-  const rawComps = [];
-  let inferredYear = null;
-
-  for(const sale of rawSales){
-    const {price, title, soldDate} = sale;
-    if(!isBowman1st(title)){
-      rawComps.push({...sale, kept:false, reason:"Not Bowman 1st"}); continue;
-    }
-    const excl = isExcluded(title);
-    if(excl){
-      rawComps.push({...sale, kept:false, reason:`Excluded: ${excl}`}); continue;
-    }
-
-    const auto = isAuto(title) ? "Auto" : "Non-Auto";
-    const type = cardType(title);
-    const parallel = detectParallel(title);
-    const grade = gradeBucket(title);
-    const yr = yearInTitle(title);
-    if(yr && (!inferredYear || yr < inferredYear)) inferredYear = yr;
-
-    const key = `${auto}|${type}|${parallel}`;
-    if(!groups[key]) groups[key] = {auto, type, parallel, all:[], p30:[], p90:[], psa10:[], psa9:[], raw:[]};
-    const g = groups[key];
-    g.all.push(price);
-    if(soldDate){
-      if(soldDate >= day30) g.p30.push(price);
-      if(soldDate >= day90) g.p90.push(price);
-    }
-    if(grade==="PSA10") g.psa10.push(price);
-    else if(grade==="PSA9") g.psa9.push(price);
-    else if(grade==="RAW") g.raw.push(price);
-
-    rawComps.push({price, title, soldDate, kept:true, auto, type, parallel, grade, yr});
-  }
-
-  const lineItems = Object.values(groups).map(g => ({
-    player: playerName, query,
-    auto: g.auto, type: g.type, parallel: g.parallel,
-    inferredYear,
-    pulledAt: now.toISOString(),
-    stats: calcStats(g.all),
-    stats30: calcStats(g.p30),
-    stats90: calcStats(g.p90),
-    psa10: calcStats(g.psa10),
-    psa9: calcStats(g.psa9),
-    raw: calcStats(g.raw),
-  })).filter(li => li.stats && li.stats.count > 0);
-
-  onProgress(`  → ${lineItems.length} line items, ${rawComps.filter(r=>r.kept).length} kept comps`);
-  return {lineItems, rawComps};
-}
 
 // ── SETTINGS MODAL ────────────────────────────────────────────────────────────
 
@@ -2464,6 +2354,8 @@ try {
 
 })();
 }
+// All scripts loaded - start the app
+boot();
 </script>
 </body>
 </html>
