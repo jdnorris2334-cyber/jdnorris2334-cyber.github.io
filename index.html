@@ -249,6 +249,127 @@ const store={
   }
 };
 
+// ── Watchlist API (Netlify Database, replaces localStorage as source of truth) ──
+async function apiListWatchlist(){
+  const r=await fetch("/api/watchlist");
+  if(!r.ok) throw new Error("watchlist fetch failed");
+  const rows=await r.json();
+  return rows.map(row=>({pid:row.pid,name:row.name}));
+}
+async function apiAddWatchlist(pid,name){
+  await fetch("/api/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pid,name})});
+}
+async function apiRemoveWatchlist(pid){
+  await fetch(`/api/watchlist?pid=${encodeURIComponent(pid)}`,{method:"DELETE"});
+}
+
+// ── Collection API (Netlify Database) ────────────────────────────────────────
+// Local shape: collection = { "pid|Auto|type|parallel": [{id,qty,pricePaid,grade,notes,dateAdded}] }
+function collectionRowToLot(row){
+  return {id:row.id, qty:row.qty, pricePaid:row.pricePaid!=null?Number(row.pricePaid):null, grade:row.grade, notes:row.notes, dateAdded:row.dateAdded};
+}
+async function apiListCollection(){
+  const r=await fetch("/api/collection");
+  if(!r.ok) throw new Error("collection fetch failed");
+  const rows=await r.json();
+  const grouped={};
+  for(const row of rows){
+    const key=collKey(row.pid, row.auto?"Auto":"Non-Auto", row.cardType, row.parallel);
+    (grouped[key]=grouped[key]||[]).push(collectionRowToLot(row));
+  }
+  return grouped;
+}
+async function apiAddCollectionLot(pid,auto,cardType,parallel,lot){
+  const r=await fetch("/api/collection",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({
+    pid, auto:auto==="Auto", cardType, parallel,
+    qty:lot.qty, pricePaid:lot.pricePaid, grade:lot.grade, notes:lot.notes,
+  })});
+  if(!r.ok) throw new Error("collection add failed");
+  return collectionRowToLot(await r.json());
+}
+async function apiRemoveCollectionLot(id){
+  await fetch(`/api/collection?id=${encodeURIComponent(id)}`,{method:"DELETE"});
+}
+async function apiUpdateCollectionLot(id,patch){
+  const r=await fetch(`/api/collection?id=${encodeURIComponent(id)}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(patch)});
+  if(!r.ok) throw new Error("collection update failed");
+  return collectionRowToLot(await r.json());
+}
+
+// ── Price history API (Netlify Database) ─────────────────────────────────────
+// DB rows are one kept comp per row; lineItems/history snapshots are re-derived
+// client-side from those rows via aggregateKeptComps (see below), grouped by pulledAt.
+function dbRowToComp(r){
+  return {id:r.id, price:Number(r.price), title:r.title, soldDate:r.soldDate,
+    auto:r.auto?"Auto":"Non-Auto", type:r.cardType, parallel:r.parallel,
+    grade:r.grade, yr:r.year, kept:r.kept!==false};
+}
+async function apiListComps(pid){
+  const r=await fetch(pid?`/api/prices?pid=${encodeURIComponent(pid)}`:"/api/prices");
+  if(!r.ok) throw new Error("prices fetch failed");
+  return r.json();
+}
+async function apiSaveComps(pid, keptComps){
+  if(!keptComps||!keptComps.length) return [];
+  const payload = keptComps.map(c=>({
+    pid,
+    price: c.price,
+    title: c.title,
+    soldDate: c.soldDate instanceof Date ? c.soldDate.toISOString() : c.soldDate,
+    auto: c.auto==="Auto",
+    cardType: c.type,
+    parallel: c.parallel,
+    grade: c.grade,
+    year: c.yr,
+    kept: true,
+  }));
+  const r=await fetch("/api/prices",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+  if(!r.ok) throw new Error("prices save failed");
+  const rows=await r.json();
+  return rows.map(dbRowToComp);
+}
+async function apiUpdateComp(id,patch){
+  const r=await fetch(`/api/prices?id=${encodeURIComponent(id)}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(patch)});
+  if(!r.ok) throw new Error("comp update failed");
+  return dbRowToComp(await r.json());
+}
+async function apiDeleteComp(id){
+  await fetch(`/api/prices?id=${encodeURIComponent(id)}`,{method:"DELETE"});
+}
+function buildPricesAndHistoryFromRows(rows){
+  const byPid={};
+  for(const row of rows){ (byPid[row.pid]=byPid[row.pid]||[]).push(row); }
+  const prices={}, history={};
+  for(const [pid,pidRows] of Object.entries(byPid)){
+    const byPull={};
+    for(const row of pidRows){ (byPull[row.pulledAt]=byPull[row.pulledAt]||[]).push(row); }
+    const pulledAts=Object.keys(byPull).sort();
+    const snapshots=pulledAts.map(t=>{
+      const comps=byPull[t].map(dbRowToComp);
+      const lineItems=aggregateKeptComps("", comps, t);
+      return {pulledAt:t, lineItems, rawComps:comps};
+    });
+    history[pid]=snapshots.map(s=>({pulledAt:s.pulledAt,lineItems:s.lineItems})).slice(-50);
+    const latest=snapshots[snapshots.length-1];
+    if(latest) prices[pid]={lineItems:latest.lineItems, pulledAt:latest.pulledAt, rawComps:latest.rawComps};
+  }
+  return {prices, history};
+}
+
+// ── Player news / game log API (Netlify Database) ───────────────────────────
+// Structured MLB Stats API data (transactions + per-game logs) cached per watchlisted
+// player; refresh replaces the cached rows for that pid rather than accumulating.
+async function apiGetNews(pid){
+  const r=await fetch(`/api/news?pid=${encodeURIComponent(pid)}`);
+  if(!r.ok) throw new Error("news fetch failed");
+  return r.json();
+}
+async function apiSaveNews(pid,transactions,gameLog){
+  const r=await fetch("/api/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pid,transactions,gameLog})});
+  if(!r.ok) throw new Error("news save failed");
+  return r.json();
+}
+
 // ── Decompress ───────────────────────────────────────────────────────────────
 async function decompress(b64){
   const bin=atob(b64),bytes=new Uint8Array(bin.length);
@@ -338,6 +459,48 @@ async function fetchHittingStats(pid, season){
   }catch{return[];}
 }
 
+// Structured transaction data — promotions/demotions, trades, injured-list moves.
+async function fetchPlayerTransactions(pid){
+  try{
+    const end=new Date().toISOString().slice(0,10);
+    const start=new Date(Date.now()-180*24*60*60*1000).toISOString().slice(0,10);
+    const r=await mlbGet(`/transactions?playerId=${pid}&startDate=${start}&endDate=${end}`);
+    return (r.transactions||[]).map(t=>({
+      date:t.date||t.effectiveDate||null,
+      typeCode:t.typeCode||null,
+      typeDesc:t.typeDesc||null,
+      description:t.description||null,
+      fromTeam:(t.fromTeam||{}).name||null,
+      toTeam:(t.toTeam||{}).name||null,
+    })).sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+  }catch{return[];}
+}
+
+// Most recent per-game hitting lines across every MiLB level (handles mid-season promotions).
+async function fetchPlayerGameLog(pid,season){
+  const all=[];
+  for(const [sid,lvl] of Object.entries(SPORT_IDS)){
+    try{
+      const r=await mlbGet(`/people/${pid}/stats?stats=gameLog&season=${season}&group=hitting&sportId=${sid}`);
+      const splits=((r.stats||[])[0]||{}).splits||[];
+      for(const s of splits){
+        const st=s.stat||{};
+        all.push({
+          date:s.date||null,
+          opponent:(s.opponent||{}).name||null,
+          team:(s.team||{}).name||null,
+          level:lvl,
+          ab:st.atBats??null,r:st.runs??null,h:st.hits??null,
+          doubles:st.doubles??null,triples:st.triples??null,hr:st.homeRuns??null,
+          rbi:st.rbi??null,sb:st.stolenBases??null,bb:st.baseOnBalls??null,k:st.strikeOuts??null,
+        });
+      }
+    }catch{}
+  }
+  all.sort((a,b)=>(b.date||"").localeCompare(a.date||""));
+  return all.slice(0,10);
+}
+
 // ── Image sharpening ─────────────────────────────────────────────────────────
 function applyAdj(src,adj,cb){
   const img=new Image();
@@ -418,9 +581,10 @@ function StatBox({label,value,color="#ddd"}){
 }
 
 // ── WATCHLIST TAB ─────────────────────────────────────────────────────────────
-function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer,onJump,autoScrollPid}){
+function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,news,onGrade,onRefreshPlayer,onJump,autoScrollPid}){
   const [adding,setAdding]=useState(false);
   const [highlightPid,setHighlightPid]=useState(null);
+  const [expanded,setExpanded]=useState({});
   const cardRefs=useRef({});
 
   // Scroll to and briefly highlight the jumped-to player
@@ -448,10 +612,14 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
     return bios.filter(b=>norm(b.n).includes(q)).slice(0,8);
   },[addSearch,bios]);
 
-  const remove=pid=>setWatchlist(w=>w.filter(x=>x.pid!==pid));
+  const remove=pid=>{
+    setWatchlist(w=>w.filter(x=>x.pid!==pid));
+    apiRemoveWatchlist(pid).catch(()=>{});
+  };
   const add=p=>{
     if(watchlist.find(w=>w.pid===p.id))return;
     setWatchlist(w=>[...w,{name:p.n,pid:p.id}]);
+    apiAddWatchlist(p.id,p.n).catch(()=>{});
     setAdding(false);setAddSearch("");
   };
 
@@ -460,6 +628,8 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
     try{ await onRefreshPlayer(w.pid); }catch{}
     setRefreshingPid(null);
   };
+
+  const toggleExpand=pid=>setExpanded(prev=>({...prev,[pid]:!prev[pid]}));
 
   return e("div",{style:{padding:20,maxWidth:1100}},
     e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}},
@@ -506,6 +676,7 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
               style:{padding:"7px 12px",background:"#141414",border:"1px solid #4FC3F7",borderRadius:6,color:refreshingPid===w.pid?"#333":"#4FC3F7",fontSize:10,cursor:refreshingPid===w.pid?"default":"pointer",letterSpacing:1}
             },refreshingPid===w.pid?"↻ REFRESHING...":"↻ REFRESH"),
             e("button",{onClick:()=>onGrade(w),style:{padding:"7px 12px",background:"#141414",border:"1px solid #c62828",borderRadius:6,color:"#c62828",fontSize:10,cursor:"pointer",letterSpacing:1}},"⚾ GRADE CARD"),
+            e("button",{onClick:()=>toggleExpand(w.pid),style:{padding:"7px 12px",background:"#141414",border:"1px solid #666",borderRadius:6,color:"#aaa",fontSize:10,cursor:"pointer",letterSpacing:1}},expanded[w.pid]?"▲ GAMES & NEWS":"▼ GAMES & NEWS"),
             e("button",{onClick:()=>remove(w.pid),style:{padding:"7px 10px",background:"#141414",border:"1px solid #2a2a2a",borderRadius:6,color:"#555",fontSize:12,cursor:"pointer"}},"✕")
           )
         ),
@@ -530,7 +701,7 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
         ),
 
         // Season history table
-        w.allStats?.length>1&&e("div",{style:{borderTop:"1px solid #1a1a1a",paddingTop:12}},
+        w.allStats?.length>1&&e("div",{style:{borderTop:"1px solid #1a1a1a",paddingTop:12,marginBottom:expanded[w.pid]?12:0}},
           e("p",{style:{fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 8px"}},"SEASON HISTORY"),
           e("div",{style:{overflowX:"auto"}},
             e("table",{style:{width:"100%",fontSize:10}},
@@ -541,7 +712,41 @@ function WatchlistTab({watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRe
               )))
             )
           )
-        )
+        ),
+
+        // Recent games + news (structured MLB transactions/injury data, cached per player)
+        expanded[w.pid]&&(()=>{
+          const gameLog=news?.[w.pid]?.gameLog||[];
+          const transactions=news?.[w.pid]?.transactions||[];
+          return e("div",{style:{borderTop:"1px solid #1a1a1a",paddingTop:12,display:"flex",flexDirection:"column",gap:16}},
+            e("div",null,
+              e("p",{style:{fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 8px"}},"RECENT GAMES"),
+              gameLog.length
+                ?e("div",{style:{overflowX:"auto"}},
+                    e("table",{style:{width:"100%",fontSize:10}},
+                      e("thead",null,e("tr",null,["DATE","OPP","LVL","AB","R","H","HR","RBI","SB","BB","K"].map(h=>e("th",{key:h,style:{padding:"3px 8px",color:"#444",fontSize:8,letterSpacing:1,textAlign:"right",borderBottom:"1px solid #1a1a1a"}},h)))),
+                      e("tbody",null,gameLog.map((g,i)=>e("tr",{key:i},
+                        [g.date,g.opponent,lvlShort(g.level),g.ab,g.r,g.h,g.hr,g.rbi,g.sb,g.bb,g.k]
+                        .map((v,j)=>e("td",{key:j,style:{padding:"4px 8px",color:"#888",textAlign:j===0||j===1||j===2?"left":"right",borderBottom:"1px solid #111"}},v??"—"))
+                      )))
+                    )
+                  )
+                :e("p",{style:{color:"#555",fontSize:11,margin:0}},"No recent games cached yet — hit ↻ REFRESH to pull the latest.")
+            ),
+            e("div",null,
+              e("p",{style:{fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 8px"}},"NEWS & TRANSACTIONS"),
+              transactions.length
+                ?e("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+                    transactions.map((t,i)=>e("div",{key:i,style:{fontSize:11,color:"#888",borderLeft:"2px solid #2a2a2a",paddingLeft:10}},
+                      e("span",{style:{color:"#4FC3F7",marginRight:8}},t.date||"—"),
+                      e("span",null,t.description||t.typeDesc||"—"),
+                      (t.fromTeam||t.toTeam)&&e("span",{style:{color:"#555",marginLeft:8}},`(${t.fromTeam||"?"} → ${t.toTeam||"?"})`)
+                    ))
+                  )
+                :e("p",{style:{color:"#555",fontSize:11,margin:0}},"No transactions or injury updates cached yet — hit ↻ REFRESH to pull the latest.")
+            )
+          );
+        })()
       ))
     )
   );
@@ -1073,13 +1278,7 @@ async function pullCardPrices(playerName, credentials, onProgress){
   const rawSales = parseEbayItems(items, playerName);
   onProgress(`  Parsed ${rawSales.length} sales with prices`);
 
-  const now = new Date();
-  const day30 = new Date(now - 30*864e5);
-  const day90 = new Date(now - 90*864e5);
-
-  const groups = {};
   const rawComps = [];
-  let inferredYear = null;
 
   for(const sale of rawSales){
     const {price, title, soldDate} = sale;
@@ -1092,6 +1291,29 @@ async function pullCardPrices(playerName, credentials, onProgress){
     const parallel = detectParallel(title);
     const grade  = gradeBucket(title);
     const yr     = yearInTitle(title);
+
+    rawComps.push({price,title,soldDate,kept:true,auto,type,parallel,grade,yr});
+  }
+
+  const pulledAt = new Date().toISOString();
+  const lineItems = aggregateKeptComps(playerName, rawComps.filter(r=>r.kept), pulledAt);
+
+  onProgress(`  → ${lineItems.length} line items, ${rawComps.filter(r=>r.kept).length} comps kept`);
+  return {lineItems, rawComps, pulledAt};
+}
+
+// ── Shared price aggregation (used at pull time and when rebuilding from saved comps) ──
+function aggregateKeptComps(playerName, keptComps, pulledAtISO){
+  const now = new Date(pulledAtISO || Date.now());
+  const day30 = new Date(now - 30*864e5);
+  const day90 = new Date(now - 90*864e5);
+
+  const groups = {};
+  let inferredYear = null;
+
+  for(const c of keptComps){
+    const {price, auto, type, parallel, grade, yr} = c;
+    const soldDate = c.soldDate ? new Date(c.soldDate) : null;
     if(yr && (!inferredYear || yr < inferredYear)) inferredYear = yr;
 
     const key = `${auto}|${type}|${parallel}`;
@@ -1102,19 +1324,14 @@ async function pullCardPrices(playerName, credentials, onProgress){
     if(grade==="PSA10") g.psa10.push(price);
     else if(grade==="PSA9") g.psa9.push(price);
     else if(grade==="RAW") g.raw.push(price);
-
-    rawComps.push({price,title,soldDate,kept:true,auto,type,parallel,grade,yr});
   }
 
-  const lineItems = Object.values(groups).map(g=>({
+  return Object.values(groups).map(g=>({
     player:playerName, auto:g.auto, type:g.type, parallel:g.parallel,
     inferredYear, pulledAt:now.toISOString(),
     stats:calcStats(g.all), stats30:calcStats(g.p30), stats90:calcStats(g.p90),
     psa10:calcStats(g.psa10), psa9:calcStats(g.psa9), raw:calcStats(g.raw),
   })).filter(li=>li.stats&&li.stats.count>0);
-
-  onProgress(`  → ${lineItems.length} line items, ${rawComps.filter(r=>r.kept).length} comps kept`);
-  return {lineItems, rawComps};
 }
 
 // ── Classification ────────────────────────────────────────────────────────────
@@ -1296,6 +1513,19 @@ function SettingsModal({clientId, clientSecret, setClientId, setClientSecret, on
 }
 
 // ── PRICES TAB ────────────────────────────────────────────────────────────────
+// Small controlled-but-local text input so typing a parallel correction doesn't
+// re-render/re-aggregate on every keystroke; the fix commits on blur/Enter.
+function RawParallelInput({value, onCommit}){
+  const [val, setVal] = React.useState(value);
+  React.useEffect(()=>{ setVal(value); },[value]);
+  return e("input",{
+    value: val,
+    onChange: ev=>setVal(ev.target.value),
+    onBlur: ()=>{ if(val!==value) onCommit(val); },
+    onKeyDown: ev=>{ if(ev.key==="Enter") ev.target.blur(); },
+    style:{width:90,background:"#0a0a0a",border:"1px solid #222",borderRadius:4,color:"#ccc",fontSize:9,padding:"2px 4px",fontFamily:"monospace"}
+  });
+}
 function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collection, setCollection, appPrices, setAppPrices, onJump, autoSelectPid}){
   const [prices, setPrices] = React.useState({});      // pid -> {lineItems, pulledAt, rawComps}
   const [history, setHistory] = React.useState({});    // pid -> [{pulledAt, lineItems}]
@@ -1311,19 +1541,37 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
   },[autoSelectPid]);
   const [tokenError, setTokenError] = React.useState(null);
   const [addPanel, setAddPanel] = React.useState(null); // {pid, li} - which row is open
+  const [rawFilter, setRawFilter] = React.useState("all");   // all | kept | excluded
+  const [rawSearch, setRawSearch] = React.useState("");
+  const [rawSort, setRawSort] = React.useState("date-desc"); // field-dir
 
-  // Load persisted prices on mount
+  // Load persisted prices from the database; migrate any legacy localStorage entries in once.
   React.useEffect(()=>{
     async function load(){
       try{
+        const rows = (await Promise.all(watchlist.map(w=>apiListComps(w.pid).catch(()=>[])))).flat();
+        const {prices:dbPrices, history:dbHistory} = buildPricesAndHistoryFromRows(rows);
+        if(Object.keys(dbPrices).length){
+          setPrices(dbPrices);
+          setHistory(dbHistory);
+          return;
+        }
+      }catch{}
+      try{
         const sp = await store.get("milb-prices");
         const sh = await store.get("milb-price-history");
-        if(sp?.value) setPrices(JSON.parse(sp.value));
+        if(sp?.value){
+          const legacyPrices=JSON.parse(sp.value);
+          setPrices(legacyPrices);
+          for(const [pid,entry] of Object.entries(legacyPrices)){
+            apiSaveComps(pid,(entry.rawComps||[]).filter(c=>c.kept)).catch(()=>{});
+          }
+        }
         if(sh?.value) setHistory(JSON.parse(sh.value));
       }catch{}
     }
-    load();
-  },[]);
+    if(watchlist.length) load();
+  },[watchlist]);
 
   // Ownership helpers
   const ownedForLi = (pid,li) => {
@@ -1333,8 +1581,10 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
   };
   const handleAddToCollection = (pid, li, lot) => {
     const key = collKey(pid, li.auto, li.type, li.parallel);
-    setCollection(prev=>({...prev,[key]:[...(prev[key]||[]),lot]}));
     setAddPanel(null);
+    apiAddCollectionLot(pid, li.auto, li.type, li.parallel, lot)
+      .then(savedLot=>setCollection(prev=>({...prev,[key]:[...(prev[key]||[]),savedLot]})))
+      .catch(()=>setCollection(prev=>({...prev,[key]:[...(prev[key]||[]),lot]})));
   };
 
   // Listen for price updates from Update All
@@ -1347,7 +1597,7 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
           const h = prevH[pid]||[];
           const snap = {pulledAt:entry.pulledAt, lineItems:entry.lineItems};
           const next2 = {...prevH, [pid]:[...h,snap].slice(-50)};
-          persist(next, next2);
+          persist(pid, entry.rawComps, next, next2);
           return next2;
         });
         return next;
@@ -1357,10 +1607,22 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
     return ()=>window.removeEventListener("milb-price-update", handler);
   },[]);
 
-  const persist = async (newPrices, newHistory) => {
-    await store.set("milb-prices", JSON.stringify(newPrices));
-    await store.set("milb-price-history", JSON.stringify(newHistory));
+  const persist = async (pid, rawComps, newPrices, newHistory) => {
     if(setAppPrices) setAppPrices(newPrices); // sync up to App for Collection tab
+    try{
+      const saved = await apiSaveComps(pid, (rawComps||[]).filter(c=>c.kept));
+      if(saved && saved.length){
+        let si=0;
+        const merged = rawComps.map(c=> c.kept ? {...c, id:(saved[si++]||{}).id ?? c.id} : c);
+        setPrices(prev=>{
+          const entry = prev[pid];
+          if(!entry) return prev;
+          const next = {...prev, [pid]: {...entry, rawComps: merged}};
+          if(setAppPrices) setAppPrices(next);
+          return next;
+        });
+      }
+    }catch{}
   };
 
   const pullPlayer = async (pid, name) => {
@@ -1372,8 +1634,7 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
     setTokenError(null);
     setPullLog([`Pulling prices for ${name}...`]);
     try{
-      const {lineItems, rawComps} = await pullCardPrices(name, {clientId, clientSecret}, msg => setPullLog(prev=>[...prev, msg]));
-      const pulledAt = new Date().toISOString();
+      const {lineItems, rawComps, pulledAt} = await pullCardPrices(name, {clientId, clientSecret}, msg => setPullLog(prev=>[...prev, msg]));
       const entry = {lineItems, rawComps, pulledAt};
 
       setPrices(prev => {
@@ -1383,7 +1644,7 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
           const h = prevH[pid] || [];
           const snapshot = {pulledAt, lineItems};
           const next2 = {...prevH, [pid]: [...h, snapshot].slice(-50)}; // keep last 50 snapshots
-          persist(next, next2);
+          persist(pid, rawComps, next, next2);
           return next2;
         });
         return next;
@@ -1402,6 +1663,76 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
     setPulling(null);
   };
 
+  // Reclassify or exclude a single raw comp, then re-aggregate lineItems from the
+  // corrected kept comps so the price stats stay in sync with what's on screen.
+  // Only kept comps live in the database, so flipping kept on/off inserts/deletes
+  // the row rather than just patching it.
+  const updateComp = (idx, patch) => {
+    const pid = activePlayer;
+    const entry = prices[pid];
+    if(!entry) return;
+    const prevComp = entry.rawComps[idx];
+    const willKeep = patch.kept !== undefined ? patch.kept : prevComp.kept;
+    const droppedFromDb = prevComp.kept && !willKeep && prevComp.id!=null;
+    const rawComps = entry.rawComps.map((c,i)=> i===idx ? {...c,...patch, ...(droppedFromDb?{id:null}:{})} : c);
+    const lineItems = aggregateKeptComps("", rawComps.filter(c=>c.kept), entry.pulledAt);
+    const nextEntry = {...entry, rawComps, lineItems};
+    const nextPrices = {...prices, [pid]: nextEntry};
+    setPrices(nextPrices);
+    if(setAppPrices) setAppPrices(nextPrices);
+    setHistory(prevH=>{
+      const h = prevH[pid]||[];
+      if(!h.length || h[h.length-1].pulledAt !== entry.pulledAt) return prevH;
+      const nextH = [...h.slice(0,-1), {pulledAt:entry.pulledAt, lineItems}];
+      return {...prevH, [pid]: nextH};
+    });
+
+    const comp = rawComps[idx];
+    if(droppedFromDb) apiDeleteComp(prevComp.id).catch(()=>{});
+    if(comp.kept){
+      if(comp.id!=null){
+        apiUpdateComp(comp.id, {
+          auto: comp.auto==="Auto", cardType: comp.type, parallel: comp.parallel, grade: comp.grade, kept: true,
+        }).catch(()=>{});
+      }else{
+        // Newly kept (e.g. restored from an excluded row) — not in the database yet.
+        apiSaveComps(pid, [comp]).then(saved=>{
+          const newId = saved?.[0]?.id;
+          if(newId==null) return;
+          setPrices(prev=>{
+            const e2 = prev[pid];
+            if(!e2) return prev;
+            const pos = e2.rawComps.indexOf(comp);
+            if(pos===-1) return prev;
+            const rc = e2.rawComps.map((cc,i)=> i===pos ? {...cc,id:newId} : cc);
+            const np = {...prev,[pid]:{...e2,rawComps:rc}};
+            if(setAppPrices) setAppPrices(np);
+            return np;
+          });
+        }).catch(()=>{});
+      }
+    }
+  };
+
+  const deleteComp = (idx) => {
+    const entry = prices[activePlayer];
+    if(!entry) return;
+    const comp = entry.rawComps[idx];
+    const rawComps = entry.rawComps.filter((_,i)=>i!==idx);
+    const lineItems = aggregateKeptComps("", rawComps.filter(c=>c.kept), entry.pulledAt);
+    const nextEntry = {...entry, rawComps, lineItems};
+    const nextPrices = {...prices, [activePlayer]: nextEntry};
+    setPrices(nextPrices);
+    if(setAppPrices) setAppPrices(nextPrices);
+    setHistory(prevH=>{
+      const h = prevH[activePlayer]||[];
+      if(!h.length || h[h.length-1].pulledAt !== entry.pulledAt) return prevH;
+      const nextH = [...h.slice(0,-1), {pulledAt:entry.pulledAt, lineItems}];
+      return {...prevH, [activePlayer]: nextH};
+    });
+    if(comp?.id!=null) apiDeleteComp(comp.id).catch(()=>{});
+  };
+
   const enriched = watchlist.map(w => {
     const bio = bios.find(b=>b.id===w.pid)||null;
     const priceData = prices[w.pid] || null;
@@ -1411,6 +1742,30 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
   const activePData = activePlayer ? prices[activePlayer] : null;
   const activeW = watchlist.find(w=>w.pid===activePlayer);
   const activeHistory = activePlayer ? (history[activePlayer]||[]) : [];
+
+  // Filtered/sorted view over the active pull's raw comps. Keeps the same object
+  // references as activePData.rawComps so indexOf() below can recover the real index.
+  const visibleRawComps = useMemo(()=>{
+    if(!activePData) return [];
+    let list = activePData.rawComps;
+    if(rawFilter==="kept") list = list.filter(c=>c.kept);
+    else if(rawFilter==="excluded") list = list.filter(c=>!c.kept);
+    if(rawSearch.trim()){
+      const q = rawSearch.trim().toLowerCase();
+      list = list.filter(c=>(c.title||"").toLowerCase().includes(q));
+    }
+    list = [...list];
+    const [field,dir] = rawSort.split("-");
+    const mul = dir==="asc" ? 1 : -1;
+    list.sort((a,b)=>{
+      if(field==="price") return ((a.price||0)-(b.price||0))*mul;
+      if(field==="parallel") return (a.parallel||"").localeCompare(b.parallel||"")*mul;
+      if(field==="type") return (a.type||"").localeCompare(b.type||"")*mul;
+      const ad=a.soldDate?new Date(a.soldDate).getTime():0, bd=b.soldDate?new Date(b.soldDate).getTime():0;
+      return (ad-bd)*mul;
+    });
+    return list;
+  },[activePData, rawFilter, rawSearch, rawSort]);
 
   // Token error banner
   const TOKEN_ERRORS = EBAY_TOKEN_ERRORS;
@@ -1596,27 +1951,84 @@ function PricesTab({watchlist, bios, clientId, clientSecret, tokenHealth, collec
           // Raw comps
           viewRaw && e("div",{style:{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:10,padding:16}},
             e("p",{style:{fontFamily:"monospace",fontSize:9,letterSpacing:2,color:"#444",margin:"0 0 12px"}},
-              `RAW COMPS — ${activePData.rawComps.length} total · ${activePData.rawComps.filter(r=>r.kept).length} kept · ${activePData.rawComps.filter(r=>!r.kept).length} excluded`
+              `RAW COMPS — ${activePData.rawComps.length} total · ${activePData.rawComps.filter(r=>r.kept).length} kept · ${activePData.rawComps.filter(r=>!r.kept).length} excluded · showing ${visibleRawComps.length}`
+            ),
+            e("div",{style:{display:"flex",gap:8,flexWrap:"wrap",marginBottom:10}},
+              e("input",{value:rawSearch,onChange:ev=>setRawSearch(ev.target.value),placeholder:"Search title...",
+                style:{background:"#111",border:"1px solid #1e1e1e",borderRadius:5,padding:"6px 8px",color:"#ccc",fontSize:10,flex:"1 1 160px",minWidth:140}}),
+              e("select",{value:rawFilter,onChange:ev=>setRawFilter(ev.target.value),style:{background:"#111",border:"1px solid #1e1e1e",borderRadius:5,padding:"6px 8px",color:"#ccc",fontSize:10,cursor:"pointer"}},
+                e("option",{value:"all"},"All"),
+                e("option",{value:"kept"},"Kept only"),
+                e("option",{value:"excluded"},"Excluded only")
+              ),
+              e("select",{value:rawSort,onChange:ev=>setRawSort(ev.target.value),style:{background:"#111",border:"1px solid #1e1e1e",borderRadius:5,padding:"6px 8px",color:"#ccc",fontSize:10,cursor:"pointer"}},
+                e("option",{value:"date-desc"},"Sort: Date ↓"),
+                e("option",{value:"date-asc"},"Sort: Date ↑"),
+                e("option",{value:"price-desc"},"Sort: Price ↓"),
+                e("option",{value:"price-asc"},"Sort: Price ↑"),
+                e("option",{value:"parallel-asc"},"Sort: Parallel A–Z"),
+                e("option",{value:"type-asc"},"Sort: Type A–Z")
+              )
             ),
             e("div",{style:{overflowX:"auto"}},
-              e("table",{style:{width:"100%",fontSize:10,minWidth:600}},
+              e("table",{style:{width:"100%",fontSize:10,minWidth:760}},
                 e("thead",null,e("tr",null,
-                  ["KEPT","PRICE","DATE","GRADE","TYPE","PARALLEL","TITLE"].map(h=>
+                  ["KEPT","PRICE","DATE","AUTO","TYPE","GRADE","PARALLEL","TITLE",""].map(h=>
                     e("th",{key:h,style:{padding:"5px 8px",color:"#444",fontSize:8,letterSpacing:1,textAlign:"left",borderBottom:"1px solid #1a1a1a",whiteSpace:"nowrap"}},h)
                   )
                 )),
                 e("tbody",null,
-                  activePData.rawComps.slice(0,200).map((c,i)=>
-                    e("tr",{key:i,style:{background:c.kept?(i%2===0?"transparent":"#080808"):"#0a0500",opacity:c.kept?1:0.5}},
-                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},e("span",{style:{color:c.kept?"#4CAF50":"#c62828",fontSize:11}},c.kept?"✓":"✗")),
+                  visibleRawComps.slice(0,200).map((c,vi)=>{
+                    const idx = activePData.rawComps.indexOf(c);
+                    return e("tr",{key:idx,style:{background:c.kept?(vi%2===0?"transparent":"#080808"):"#0a0500",opacity:c.kept?1:0.5}},
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},
+                        e("button",{onClick:()=>{
+                            if(c.kept){ updateComp(idx,{kept:false}); return; }
+                            // Restoring an excluded comp — it never got classified, so auto-classify
+                            // from the title as a starting point the user can still correct by hand.
+                            updateComp(idx,{kept:true,
+                              auto:isAuto(c.title||"")?"Auto":"Non-Auto",
+                              type:cardType(c.title||""),
+                              parallel:detectParallel(c.title||""),
+                              grade:gradeBucket(c.title||""),
+                              yr:c.yr??yearInTitle(c.title||""),
+                            });
+                          },title:c.kept?"Exclude comp":"Keep comp",
+                          style:{background:"none",border:"none",color:c.kept?"#4CAF50":"#c62828",fontSize:11,cursor:"pointer"}},c.kept?"✓":"✗")
+                      ),
                       e("td",{style:{padding:"4px 8px",color:"#4CAF50",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontWeight:600}},`$${c.price.toFixed(2)}`),
                       e("td",{style:{padding:"4px 8px",color:"#555",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.soldDate?new Date(c.soldDate).toLocaleDateString():"—"),
-                      e("td",{style:{padding:"4px 8px",color:"#888",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.grade||"—"),
-                      e("td",{style:{padding:"4px 8px",color:"#888",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.type||(c.kept?"":c.reason)||"—"),
-                      e("td",{style:{padding:"4px 8px",color:"#666",borderBottom:"1px solid #111",whiteSpace:"nowrap",fontSize:9}},c.parallel||"—"),
-                      e("td",{style:{padding:"4px 8px",color:"#aaa",borderBottom:"1px solid #111",fontSize:10,maxWidth:280,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},c.title||"—")
-                    )
-                  )
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},
+                        e("select",{value:c.auto||"Non-Auto",onChange:ev=>updateComp(idx,{auto:ev.target.value}),
+                          style:{background:"#0a0a0a",border:"1px solid #222",borderRadius:4,color:"#ccc",fontSize:9,padding:"2px 2px"}},
+                          e("option",{value:"Auto"},"Auto"),e("option",{value:"Non-Auto"},"Non-Auto")
+                        )
+                      ),
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},
+                        c.kept
+                          ? e("select",{value:c.type||"Chrome",onChange:ev=>updateComp(idx,{type:ev.target.value}),
+                              style:{background:"#0a0a0a",border:"1px solid #222",borderRadius:4,color:"#ccc",fontSize:9,padding:"2px 2px"}},
+                              e("option",{value:"Chrome"},"Chrome"),e("option",{value:"Paper"},"Paper")
+                            )
+                          : e("span",{style:{color:"#666",fontSize:9,whiteSpace:"nowrap"}},c.reason||"—")
+                      ),
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},
+                        e("select",{value:c.grade||"RAW",onChange:ev=>updateComp(idx,{grade:ev.target.value}),
+                          style:{background:"#0a0a0a",border:"1px solid #222",borderRadius:4,color:"#ccc",fontSize:9,padding:"2px 2px"}},
+                          ["RAW","PSA9","PSA10","OTHER_PSA"].map(g=>e("option",{key:g,value:g},g))
+                        )
+                      ),
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111"}},
+                        e(RawParallelInput,{value:c.parallel||"", onCommit:val=>updateComp(idx,{parallel:val})})
+                      ),
+                      e("td",{style:{padding:"4px 8px",color:"#aaa",borderBottom:"1px solid #111",fontSize:10,maxWidth:280,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},c.title||"—"),
+                      e("td",{style:{padding:"4px 8px",borderBottom:"1px solid #111",textAlign:"right"}},
+                        e("button",{onClick:()=>deleteComp(idx),title:"Remove from dataset",
+                          style:{background:"none",border:"none",color:"#3a1a1a",fontSize:12,cursor:"pointer",padding:"0 2px"},
+                          onMouseEnter:ev=>ev.currentTarget.style.color="#F44336",onMouseLeave:ev=>ev.currentTarget.style.color="#3a1a1a"},"✕")
+                      )
+                    );
+                  })
                 )
               )
             )
@@ -1753,6 +2165,7 @@ function CollectionTab({collection, setCollection, watchlist, bios, prices, onJu
   const players = useMemo(()=>[...new Set(allEntries.map(r=>({pid:r.pid,name:r.playerName})).map(JSON.stringify))].map(JSON.parse),[allEntries]);
 
   const removeLot = (key, lotIdx) => {
+    const lot = (collection[key]||[])[lotIdx];
     setCollection(prev=>{
       const next={...prev};
       const lots=[...(next[key]||[])];
@@ -1760,6 +2173,30 @@ function CollectionTab({collection, setCollection, watchlist, bios, prices, onJu
       if(lots.length) next[key]=lots; else delete next[key];
       return next;
     });
+    if(lot?.id!=null) apiRemoveCollectionLot(lot.id).catch(()=>{});
+  };
+
+  // Send the full lot payload on every quantity edit (not just qty) so the PUT
+  // never overwrites the other columns with undefined.
+  const updateLotQty = (row, lotIdx, newQty) => {
+    if(newQty === "") return; // mid-edit; wait for a real value
+    const parsed = parseInt(newQty,10);
+    if(!Number.isFinite(parsed)) return;
+    if(parsed<=0){ removeLot(row.key, lotIdx); return; }
+    const qty = parsed;
+    const lot = row.lots[lotIdx];
+    setCollection(prev=>{
+      const lots=[...(prev[row.key]||[])];
+      if(!lots[lotIdx]) return prev;
+      lots[lotIdx] = {...lots[lotIdx], qty};
+      return {...prev, [row.key]: lots};
+    });
+    if(lot?.id!=null){
+      apiUpdateCollectionLot(lot.id, {
+        auto: row.auto==="Auto", cardType: row.type, parallel: row.parallel,
+        qty, pricePaid: lot.pricePaid, grade: lot.grade, notes: lot.notes,
+      }).catch(()=>{});
+    }
   };
 
   const glColor = gl => gl==null?"#555":gl>0?"#4CAF50":gl<0?"#F44336":"#888";
@@ -1848,7 +2285,11 @@ function CollectionTab({collection, setCollection, watchlist, bios, prices, onJu
             )),
             e("tbody",null,
               row.lots.map((lot,li)=>e("tr",{key:li,style:{background:li%2===0?"transparent":"#0a0a0a"}},
-                e("td",{style:{padding:"5px 8px",color:"#ccc",borderBottom:"1px solid #111"}},lot.qty||1),
+                e("td",{style:{padding:"5px 8px",color:"#ccc",borderBottom:"1px solid #111"}},
+                  e("input",{type:"number",min:0,value:lot.qty||1,title:"Set to 0 to remove this lot",
+                    onChange:ev=>updateLotQty(row,li,ev.target.value),
+                    style:{width:44,background:"#0a0a0a",border:"1px solid #222",borderRadius:4,color:"#ccc",fontSize:10,padding:"2px 4px",fontFamily:"monospace"}})
+                ),
                 e("td",{style:{padding:"5px 8px",borderBottom:"1px solid #111"}},
                   e("span",{style:{fontSize:9,padding:"1px 5px",borderRadius:3,
                     background:lot.grade==="PSA10"?"#1a1500":lot.grade==="PSA9"?"#111":"#0a0a0a",
@@ -1861,7 +2302,7 @@ function CollectionTab({collection, setCollection, watchlist, bios, prices, onJu
                 e("td",{style:{padding:"5px 8px",color:"#555",borderBottom:"1px solid #111",whiteSpace:"nowrap"}},lot.dateAdded?new Date(lot.dateAdded).toLocaleDateString():"—"),
                 e("td",{style:{padding:"5px 8px",color:"#555",borderBottom:"1px solid #111",maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},lot.notes||"—"),
                 e("td",{style:{padding:"5px 8px",borderBottom:"1px solid #111",textAlign:"right"}},
-                  e("button",{onClick:()=>removeLot(row.key,li),style:{background:"none",border:"none",color:"#3a1a1a",fontSize:12,cursor:"pointer",padding:"0 2px"},onMouseEnter:ev=>ev.currentTarget.style.color="#F44336",onMouseLeave:ev=>ev.currentTarget.style.color="#3a1a1a"},"✕")
+                  e("button",{onClick:()=>removeLot(row.key,li),title:"Remove this lot",style:{padding:"4px 8px",background:"#141414",border:"1px solid #2a2a2a",borderRadius:5,color:"#888",fontSize:11,cursor:"pointer"},onMouseEnter:ev=>{ev.currentTarget.style.color="#F44336";ev.currentTarget.style.borderColor="#F44336";},onMouseLeave:ev=>{ev.currentTarget.style.color="#888";ev.currentTarget.style.borderColor="#2a2a2a";}},"✕")
                 )
               ))
             )
@@ -1948,6 +2389,7 @@ function App(){
   const [jumpMenu,setJumpMenu]=useState(null); // {player, currentTab}
   const [collection,setCollection]=useState({});
   const [prices,setPrices]=useState({}); // latest price data for Collection tab // collKey -> [{qty,pricePaid,grade,notes,dateAdded}]
+  const [news,setNews]=useState({}); // pid -> {transactions,gameLog} — recent games + roster/injury moves
   const [prospectFilter,setProspectFilter]=useState(null);
   const [statcastFilter,setStatcastFilter]=useState(null);
   const [fgFilter,setFgFilter]=useState(null);
@@ -1985,7 +2427,6 @@ function App(){
           const storedBios=await store.get("milb-bios-live");
           const storedHit=await store.get("milb-hit-live");
           const storedSc=await store.get("milb-sc-live");
-          const storedWl=await store.get("milb-watchlist");
 
           const liveBios=storedBios?.value?JSON.parse(storedBios.value):[];
           const liveHit=storedHit?.value?JSON.parse(storedHit.value):[];
@@ -1997,15 +2438,94 @@ function App(){
           // Load FG from localStorage if available, otherwise use embedded
           const storedFg=await store.get("milb-fg-live");
           setFg(storedFg?.value ? JSON.parse(storedFg.value) : rawFg);
-          if(storedWl?.value)setWatchlist(JSON.parse(storedWl.value));
         }catch{
           setBios(rawBios);setHitting(allHit);setStatcast(rawSc);setFg(rawFg);
         }
 
+        // Load watchlist from the database; migrate any legacy localStorage entries in once.
+        try{
+          const dbWatchlist=await apiListWatchlist();
+          const storedWl=await store.get("milb-watchlist");
+          if(dbWatchlist.length){
+            setWatchlist(dbWatchlist);
+          }else if(storedWl?.value){
+            const legacy=JSON.parse(storedWl.value);
+            setWatchlist(legacy);
+            legacy.forEach(w=>{ apiAddWatchlist(w.pid,w.name).catch(()=>{}); });
+          }
+        }catch{
+          try{
+            const storedWl=await store.get("milb-watchlist");
+            if(storedWl?.value)setWatchlist(JSON.parse(storedWl.value));
+          }catch{}
+        }
+
+        // Load watchlist from the database; migrate any legacy localStorage entries in once.
+        let resolvedWatchlist=[];
+        try{
+          const dbWatchlist=await apiListWatchlist();
+          const storedWl=await store.get("milb-watchlist");
+          if(dbWatchlist.length){
+            setWatchlist(dbWatchlist);
+            resolvedWatchlist=dbWatchlist;
+          }else if(storedWl?.value){
+            const legacy=JSON.parse(storedWl.value);
+            setWatchlist(legacy);
+            resolvedWatchlist=legacy;
+            legacy.forEach(w=>{ apiAddWatchlist(w.pid,w.name).catch(()=>{}); });
+          }
+        }catch{
+          try{
+            const storedWl=await store.get("milb-watchlist");
+            if(storedWl?.value){
+              resolvedWatchlist=JSON.parse(storedWl.value);
+              setWatchlist(resolvedWatchlist);
+            }
+          }catch{}
+        }
+
+        // Load collection from the database; migrate any legacy localStorage entries in once.
+        try{
+          const dbCollection = await apiListCollection();
+          if(Object.keys(dbCollection).length){
+            setCollection(dbCollection);
+          }else{
+            const sc2=await store.get("milb-collection");
+            if(sc2?.value){
+              const legacy=JSON.parse(sc2.value);
+              setCollection(legacy);
+              for(const [key,lots] of Object.entries(legacy)){
+                const [pid,auto,cardType,parallel]=key.split("|");
+                for(const lot of lots){ apiAddCollectionLot(pid,auto,cardType,parallel,lot).catch(()=>{}); }
+              }
+            }
+          }
+        }catch{
+          try{ const sc2=await store.get("milb-collection"); if(sc2?.value)setCollection(JSON.parse(sc2.value)); }catch{}
+        }
+
+        // Load prices (for Collection tab valuations) from the database, scoped to the watchlist
+        try{
+          const rows=(await Promise.all(resolvedWatchlist.map(w=>apiListComps(w.pid).catch(()=>[])))).flat();
+          const {prices:dbPrices}=buildPricesAndHistoryFromRows(rows);
+          if(Object.keys(dbPrices).length) setPrices(dbPrices);
+          else{ const sp2=await store.get("milb-prices"); if(sp2?.value)setPrices(JSON.parse(sp2.value)); }
+        }catch{
+          try{ const sp2=await store.get("milb-prices"); if(sp2?.value)setPrices(JSON.parse(sp2.value)); }catch{}
+        }
+
+        // Load cached player news/game logs from the database, scoped to the watchlist
+        try{
+          const newsPairs=await Promise.all(resolvedWatchlist.map(w=>apiGetNews(w.pid).then(d=>[w.pid,d]).catch(()=>[w.pid,null])));
+          const newsMap={};
+          for(const [pid,data] of newsPairs){ if(data) newsMap[pid]=data; }
+          if(Object.keys(newsMap).length) setNews(newsMap);
+        }catch{}
+
         // Load saved token
-        try{const sc2=await store.get("milb-collection");if(sc2?.value)setCollection(JSON.parse(sc2.value));
-        const sp2=await store.get("milb-prices");if(sp2?.value)setPrices(JSON.parse(sp2.value));
-        const si=await store.get("milb-ebay-client-id");const ss=await store.get("milb-ebay-client-secret");if(si?.value)setClientId(si.value);if(ss?.value)setClientSecret(ss.value);}catch{}
+        try{
+          const si=await store.get("milb-ebay-client-id");const ss=await store.get("milb-ebay-client-secret");if(si?.value)setClientId(si.value);if(ss?.value)setClientSecret(ss.value);
+        }catch{}
         setLoadPct(100);setLoadMsg("Ready!");
         setTimeout(()=>setReady(true),200);
       }catch(err){
@@ -2037,16 +2557,11 @@ function App(){
     return [...map.values()];
   }
 
-  // ── Persist watchlist ──────────────────────────────────────────────────────
-  useEffect(()=>{
-    if(!ready)return;
-    store.set("milb-watchlist",JSON.stringify(watchlist));
-  },[watchlist,ready]);
+  // Watchlist is persisted to the database directly at each add/remove call site (see
+  // WatchlistTab's add/remove and onAddToWatchlist below) rather than mirrored here.
 
-  useEffect(()=>{
-    if(!ready)return;
-    store.set("milb-collection",JSON.stringify(collection));
-  },[collection,ready]);
+  // Collection is persisted to the database directly at each add/remove call site (see
+  // PricesTab's handleAddToCollection and CollectionTab's removeLot) rather than mirrored here.
 
   // ── Live refresh: all rosters ──────────────────────────────────────────────
   const handleLiveRefreshAll=async()=>{
@@ -2104,6 +2619,16 @@ function App(){
       const newHit=mergeHitting(existingHit,stats.map(s=>({...s,id:pid})));
       await store.set("milb-hit-live",JSON.stringify(newHit));
     }catch(err){console.error("Refresh failed:",err);}
+    // Query news/game-log alongside stats — structured MLB transaction + gameLog data,
+    // persisted to the database so it survives across sessions.
+    try{
+      const [transactions,gameLog]=await Promise.all([
+        fetchPlayerTransactions(pid),
+        fetchPlayerGameLog(pid,CURRENT_SEASON),
+      ]);
+      const saved=await apiSaveNews(pid,transactions,gameLog);
+      setNews(prev=>({...prev,[pid]:saved}));
+    }catch(err){console.error("News refresh failed:",err);}
   };
 
   // ── Statcast import (smart merge) ─────────────────────────────────────────
@@ -2180,8 +2705,7 @@ function App(){
         setUpdateAllStatus(prev=>({...prev,[key]:{...prev[key],prices:"running"}}));
         try{
           // Re-use pullCardPrices directly and update prices state
-          const {lineItems, rawComps} = await pullCardPrices(w.name, {clientId, clientSecret}, ()=>{});
-          const pulledAt = new Date().toISOString();
+          const {lineItems, rawComps, pulledAt} = await pullCardPrices(w.name, {clientId, clientSecret}, ()=>{});
           const entry = {lineItems, rawComps, pulledAt};
           // Update price state — dispatch custom event for PricesTab to pick up
           window.__milbPriceUpdate = window.__milbPriceUpdate||{};
@@ -2235,6 +2759,7 @@ function App(){
   const onAddToWatchlist=player=>{
     if(watchlist.find(w=>w.pid===player.id))return;
     setWatchlist(w=>[...w,{name:player.n,pid:player.id}]);
+    apiAddWatchlist(player.id,player.n).catch(()=>{});
     setTab(0);
   };
 
@@ -2301,7 +2826,7 @@ function App(){
       refreshLog.map((l,i)=>e("p",{key:i,style:{fontSize:10,color:"#888",margin:"2px 0",fontFamily:"monospace"}},l))
     ),
 
-    tab===0&&e(WatchlistTab,{watchlist,setWatchlist,bios,hitting,statcast,onGrade,onRefreshPlayer:handleRefreshPlayer,onJump:(p)=>setJumpMenu({player:p,currentTab:0}),autoScrollPid:watchlistFilter}),
+    tab===0&&e(WatchlistTab,{watchlist,setWatchlist,bios,hitting,statcast,news,onGrade,onRefreshPlayer:handleRefreshPlayer,onJump:(p)=>setJumpMenu({player:p,currentTab:0}),autoScrollPid:watchlistFilter}),
     tab===1&&e(CollectionTab,{collection,setCollection,watchlist,bios,prices,onJump:(p)=>setJumpMenu({player:p,currentTab:1}),autoFilterPid:collectionFilter}),
     tab===2&&e(ProspectsTab,{bios,hitting,onAddToWatchlist,onLiveRefreshAll:handleLiveRefreshAll,refreshing,autoSelectId:prospectFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:2})}),
     tab===3&&e(StatcastTab,{statcast,bios,onImportStatcast:handleImportStatcast,autoFilter:statcastFilter,onJump:(p)=>setJumpMenu({player:p,currentTab:3})}),
