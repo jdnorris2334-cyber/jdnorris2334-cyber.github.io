@@ -2435,9 +2435,11 @@ function App(){
           setBios(mergeBios(rawBios,liveBios));
           setHitting(mergeHitting(allHit,liveHit));
           setStatcast(mergeSc(rawSc,liveSc));
-          // Load FG from localStorage if available, otherwise use embedded
+          // Merge FG scouting data with the embedded baseline — a plain replace would
+          // mean the baseline prospect rankings vanish entirely after the first CSV import.
           const storedFg=await store.get("milb-fg-live");
-          setFg(storedFg?.value ? JSON.parse(storedFg.value) : rawFg);
+          const liveFg=storedFg?.value?JSON.parse(storedFg.value):[];
+          setFg(mergeFg(rawFg,liveFg));
         }catch{
           setBios(rawBios);setHitting(allHit);setStatcast(rawSc);setFg(rawFg);
         }
@@ -2556,6 +2558,34 @@ function App(){
     for(const s of live) map.set(key(s),{...s,liveRefreshed:true});
     return [...map.values()];
   }
+  // FanGraphs CSV rows carry no MLB pid, so dedupe/merge by normalized player name —
+  // a fresh CSV import should update known prospects and add new ones, not replace
+  // the whole scouting list with whatever this one file happens to contain.
+  function mergeFg(base,live){
+    const key=p=>norm(p.n);
+    const map=new Map(base.map(p=>[key(p),p]));
+    for(const p of live) map.set(key(p),{...map.get(key(p))||{},...p});
+    return [...map.values()];
+  }
+
+  // fetchBio() only returns physical attributes (age/height/etc.) and never reflects
+  // promotions or trades, so a single-player refresh otherwise leaves the displayed
+  // team/level frozen at whatever the dataset last recorded. Derive the current team
+  // from the freshest signal available: the most recent roster-move transaction (which
+  // lands before a game is ever played at the new stop) falling back to the most recent
+  // game log entry's team/level. allBios is used to borrow the level/org for a team name
+  // we don't already have a boxscore level for.
+  function resolveCurrentTeam(gameLog,transactions,allBios){
+    const latestGame=(gameLog||[])[0]||null;
+    const latestMove=(transactions||[]).find(t=>t.toTeam);
+    const useMove=latestMove&&(!latestGame||(latestMove.date||"")>=(latestGame.date||""));
+    const tm=useMove?latestMove.toTeam:(latestGame?.team||null);
+    if(!tm) return null;
+    const known=(allBios||[]).find(b=>b.tm===tm);
+    const lvl=(!useMove&&latestGame?.level)?latestGame.level:(known?.lvl||null);
+    const org=known?.org||null;
+    return {tm,...(lvl?{lvl}:{}),...(org?{org}:{})};
+  }
 
   // Watchlist is persisted to the database directly at each add/remove call site (see
   // WatchlistTab's add/remove and onAddToWatchlist below) rather than mirrored here.
@@ -2569,6 +2599,8 @@ function App(){
     const log=[];
     const newBios=[];
     const newHit=[];
+    let savedCount=0,saveFailCount=0,newPlayerCount=0;
+    const knownIds=new Set(bios.map(b=>b.id));
     try{
       for(const [sid,lvl] of Object.entries(SPORT_IDS)){
         log.push(`Fetching ${lvl} rosters...`);
@@ -2577,12 +2609,52 @@ function App(){
           const players=await fetchRosterForSport(parseInt(sid),CURRENT_SEASON);
           log.push(`  → ${players.length} players`);
           setRefreshLog([...log]);
+          let savedThisLevel=0;
           for(const p of players){
-            newBios.push(p);
+            let playerRecord=p;
+            // A roster player absent from the original/known dataset is a brand-new
+            // addition (signed, drafted, etc.) — fetch their full bio so they're intaken
+            // as a complete profile rather than a bare roster stub.
+            if(!knownIds.has(p.id)){
+              knownIds.add(p.id);
+              newPlayerCount++;
+              try{
+                const extraBio=await fetchBio(p.id);
+                playerRecord={...p,...extraBio};
+              }catch{}
+              log.push(`  + New player intake: ${p.n}`);
+              setRefreshLog([...log]);
+            }
             // Fetch 2026 hitting stats
             const stats=await fetchHittingStats(p.id,CURRENT_SEASON);
             newHit.push(...stats);
+            // Persist this player's per-game log + transactions to the database so
+            // stats survive across sessions and untracked players become queryable.
+            log.push(`  Saving ${p.n} to database...`);
+            setRefreshLog([...log]); // show transient status
+            let transactions=[],gameLog=[];
+            try{
+              [transactions,gameLog]=await Promise.all([
+                fetchPlayerTransactions(p.id),
+                fetchPlayerGameLog(p.id,CURRENT_SEASON),
+              ]);
+              await apiSaveNews(p.id,transactions,gameLog);
+              log.pop(); // drop transient status line on success
+              savedCount++;savedThisLevel++;
+            }catch(err){
+              log.pop(); // drop transient status line before logging the failure
+              saveFailCount++;
+              log.push(`  ⚠ Saving ${p.n} to database failed: ${err.message}`);
+              setRefreshLog([...log]);
+            }
+            // A transaction more recent than this roster scan (e.g. a just-announced
+            // move not yet reflected on the destination team's roster page) should win
+            // over the roster-sourced team/level.
+            const teamUpdate=resolveCurrentTeam(gameLog,transactions,bios);
+            if(teamUpdate) playerRecord={...playerRecord,...teamUpdate};
+            newBios.push(playerRecord);
           }
+          log.push(`  ✓ saved ${savedThisLevel} of ${players.length} ${lvl} players to database`);
         }catch(err){log.push(`  ⚠ ${lvl} failed: ${err.message}`);}
         setRefreshLog([...log]);
       }
@@ -2593,6 +2665,8 @@ function App(){
       await store.set("milb-bios-live",JSON.stringify(newBios));
       await store.set("milb-hit-live",JSON.stringify(newHit));
       log.push(`✓ Done! ${newBios.length} players, ${newHit.length} stat rows updated.`);
+      log.push(`✓ Intake: ${newPlayerCount} new player${newPlayerCount===1?"":"s"} added to the dataset.`);
+      log.push(`✓ Saved game logs to database for ${savedCount} players${saveFailCount?` (${saveFailCount} failed)`:""}.`);
     }catch(err){log.push("⚠ Error: "+err.message);}
     setRefreshLog([...log]);
     setRefreshing(false);
@@ -2628,6 +2702,18 @@ function App(){
       ]);
       const saved=await apiSaveNews(pid,transactions,gameLog);
       setNews(prev=>({...prev,[pid]:saved}));
+      // Keep the displayed team/level current. fetchBio() never reflects promotions or
+      // trades, so re-derive the team from whichever signal is freshest here instead.
+      const teamUpdate=resolveCurrentTeam(gameLog,transactions,bios);
+      if(teamUpdate){
+        setBios(prev=>mergeBios(prev,[{id:pid,...teamUpdate}]));
+        const storedBios=await store.get("milb-bios-live");
+        const existing=storedBios?.value?JSON.parse(storedBios.value):[];
+        const idx=existing.findIndex(b=>b.id===pid);
+        if(idx>=0)existing[idx]={...existing[idx],...teamUpdate,liveRefreshed:true};
+        else existing.push({id:pid,...teamUpdate,liveRefreshed:true});
+        await store.set("milb-bios-live",JSON.stringify(existing));
+      }
     }catch(err){console.error("News refresh failed:",err);}
   };
 
@@ -2635,7 +2721,10 @@ function App(){
   const handleImportStatcast=useCallback(async(newRows)=>{
     setStatcast(prev=>{
       const merged=mergeSc(prev,newRows);
-      store.set("milb-sc-live",JSON.stringify(newRows));
+      // Persist the merged set, not just this upload — otherwise a later reload
+      // re-merges the embedded baseline with only the most recent import and silently
+      // drops every earlier upload's rows that the new file doesn't also include.
+      store.set("milb-sc-live",JSON.stringify(merged));
       return merged;
     });
   },[]);
@@ -2652,9 +2741,13 @@ function App(){
         const obj={};headers.forEach((h,i)=>obj[h]=vals[i]||null);
         return{n:obj.Name||"",pos:obj.Pos||"",org:obj.Org||"",rk:parseFloat(obj["Top 100"])||null,age:parseFloat(obj.Age)||null,hit:obj.Hit||"",pwr_g:obj["Game Pwr"]||"",pwr_r:obj["Raw Pwr"]||"",spd:obj.Spd||"",fld:obj.Fld||"",fv:obj.FV||"",hh:parseFloat(obj["Hard Hit%"])||null,cs:obj["Con Style"]||""};
       }).filter(r=>r.n);
-      setFg(rows);
-      // Persist FG import to localStorage
-      store.set("milb-fg-live", JSON.stringify(rows));
+      setFg(prev=>{
+        // Merge into whatever's already loaded — a straight replace would drop every
+        // previously imported prospect that this particular CSV doesn't also list.
+        const merged=mergeFg(prev,rows);
+        store.set("milb-fg-live", JSON.stringify(merged));
+        return merged;
+      });
     };
     reader.readAsText(file);
   };
